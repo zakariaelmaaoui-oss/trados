@@ -1,0 +1,28 @@
+{
+  "name": "tradeos",
+  "version": "1.0.0",
+  "description": "TradeOS — trading journal, planner, economic calendar and web push alerts",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "NODE_USE_ENV_PROXY=1 node --watch --no-warnings=ExperimentalWarning server/index.js",
+    "dev:client": "vite",
+    "build": "vite build",
+    "start": "node --no-warnings=ExperimentalWarning server/index.js",
+    "test": "node --no-warnings=ExperimentalWarning --test tests/*.test.js",
+    "test:e2e": "node tests/e2e/run.cjs",
+    "test:all": "npm test && npm run build && npm run test:e2e"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "web-push": "^4.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.30.6",
+    "vite": "^5.4.21"
+  },
+  "private": true,
+  "type": "module"
+}
