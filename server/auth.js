@@ -19,17 +19,16 @@ export function verifyPassword(pw, stored) {
 
 const sha256 = s => crypto.createHash('sha256').update(s).digest('hex');
 
-export function createSession(db, userId) {
+export async function createSession(db, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
-  db.prepare('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)')
-    .run(sha256(token), userId, now + SESSION_TTL_MS, now);
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+  await db.run('INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)', sha256(token), userId, now + SESSION_TTL_MS, now);
+  await db.run('DELETE FROM sessions WHERE expires_at < ?', now);
   return { token, maxAge: SESSION_TTL_MS };
 }
 
-export function destroySession(db, token) {
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+export async function destroySession(db, token) {
+  if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', sha256(token));
 }
 
 export function parseCookies(header = '') {
@@ -50,14 +49,16 @@ export function sessionCookie(token, maxAgeMs, secure) {
 
 /** Attaches req.user when a valid session cookie is present. */
 export function loadUser(db) {
-  const q = db.prepare(`SELECT u.id, u.email, u.display_name, u.default_risk_pct, u.timezone, u.active_mode
-                        FROM sessions s JOIN users u ON u.id = s.user_id
-                        WHERE s.token_hash = ? AND s.expires_at > ?`);
-  return (req, _res, next) => {
-    const token = parseCookies(req.headers.cookie)[COOKIE];
-    req.sessionToken = token;
-    req.user = token ? q.get(sha256(token), Date.now()) || null : null;
-    next();
+  const sql = `SELECT u.id, u.email, u.display_name, u.default_risk_pct, u.timezone, u.active_mode
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.token_hash = ? AND s.expires_at > ?`;
+  return async (req, _res, next) => {
+    try {
+      const token = parseCookies(req.headers.cookie)[COOKIE];
+      req.sessionToken = token;
+      req.user = token ? (await db.get(sql, sha256(token), Date.now())) || null : null;
+      next();
+    } catch (e) { next(e); }
   };
 }
 

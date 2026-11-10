@@ -15,15 +15,30 @@ export function tmpDir(prefix = 'tradeos-test-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+/**
+ * Fresh database per test. Default: in-memory embedded Postgres (PGlite).
+ * With TEST_DATABASE_URL (e.g. postgres://postgres@127.0.0.1:55432/postgres) a
+ * throwaway database is created on that real server and used via the `pg` driver.
+ */
+export async function testDb() {
+  const admin = process.env.TEST_DATABASE_URL;
+  if (!admin) return openDb({ url: null });
+  const { default: pg } = await import('pg');
+  const name = `tradeos_test_${crypto.randomBytes(6).toString('hex')}`;
+  const c = new pg.Client({ connectionString: admin });
+  await c.connect(); await c.query(`CREATE DATABASE ${name}`); await c.end();
+  const u = new URL(admin); u.pathname = `/${name}`;
+  return openDb({ url: u.toString() });
+}
+
 export async function startApp({ fetchImpl, now, agent } = {}) {
-  const dir = tmpDir();
-  const db = openDb(path.join(dir, 'test.db'));
-  const vapid = loadVapid(db, {});
+  const db = await testDb();
+  const vapid = await loadVapid(db, {});
   const sender = createSender(vapid, { agent });
-  const app = createApp(db, { dataDir: dir, vapid, sender, fetchImpl, now });
+  const app = createApp(db, { vapid, sender, fetchImpl, now, cronSecret: 'test-cron-secret' });
   const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
-  return { db, dir, vapid, sender, base, close: () => new Promise((r) => server.close(r)) };
+  return { db, vapid, sender, base, close: async () => { await new Promise((r) => server.close(r)); await db.close(); } };
 }
 
 export function client(base) {

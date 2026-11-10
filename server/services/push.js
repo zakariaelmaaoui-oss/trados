@@ -8,16 +8,16 @@ import { kvGet, kvSet } from '../db.js';
  * If absent they are generated once and persisted in the database so existing
  * browser subscriptions stay valid across restarts.
  */
-export function loadVapid(db, env = process.env) {
+export async function loadVapid(db, env = process.env) {
   let publicKey = env.VAPID_PUBLIC_KEY;
   let privateKey = env.VAPID_PRIVATE_KEY;
   if (!publicKey || !privateKey) {
-    publicKey = kvGet(db, 'vapid.public');
-    privateKey = kvGet(db, 'vapid.private');
+    publicKey = await kvGet(db, 'vapid.public');
+    privateKey = await kvGet(db, 'vapid.private');
     if (!publicKey || !privateKey) {
       ({ publicKey, privateKey } = webpush.generateVAPIDKeys());
-      kvSet(db, 'vapid.public', publicKey);
-      kvSet(db, 'vapid.private', privateKey);
+      await kvSet(db, 'vapid.public', publicKey);
+      await kvSet(db, 'vapid.private', privateKey);
     }
   }
   const subject = env.VAPID_SUBJECT || 'mailto:admin@tradeos.invalid';

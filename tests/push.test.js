@@ -82,7 +82,7 @@ test('impact filters: High-only users get no Medium alerts; Low is off by defaul
     assert.equal(deflt.got().length, 2);
 
     // Low-impact events: pick a real one from the provider data and alert on it only after opting in.
-    const low = app.db.prepare("SELECT * FROM econ_events WHERE impact='low' AND all_day=0 AND currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD') AND scheduled_at > ? ORDER BY scheduled_at LIMIT 1").get(new Date(T + 3600e3).toISOString());
+    const low = await app.db.get("SELECT * FROM econ_events WHERE impact='low' AND all_day=0 AND currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD') AND scheduled_at > ? ORDER BY scheduled_at LIMIT 1", new Date(T + 3600e3).toISOString());
     assert.ok(low, 'recorded provider data has a low-impact event');
     const lowAt = Date.parse(low.scheduled_at) - 30 * 60000;
     await syncCalendar(app.db, { fetchImpl: recordedProviderFetch(), now: new Date(lowAt - 3600e3) });
@@ -192,5 +192,21 @@ test('test notification endpoint and subscription validation', async () => {
     const { c: other } = await registerUser(app.base, 'switch@example.com');
     await other.post('/api/push/subscribe', { subscription: u.sub.json });
     assert.equal((await u.c.get('/api/push/subscriptions')).data.subscriptions.length, 0);
+  } finally { await app.close(); }
+});
+
+test('cron endpoint (used by cron-job.org on Vercel) requires the secret and runs the jobs', async () => {
+  const { app, user } = await setup();
+  try {
+    const u = await user('cron@example.com', { dailyBriefing: false });
+    assert.equal((await fetch(`${app.base}/api/cron/tick`)).status, 401);
+    assert.equal((await fetch(`${app.base}/api/cron/tick`, { headers: { Authorization: 'Bearer wrong' } })).status, 401);
+    const r = await fetch(`${app.base}/api/cron/tick`, { headers: { Authorization: 'Bearer test-cron-secret' } });
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.ok(body.notifications && typeof body.notifications.claimed === 'number');
+    const q = await fetch(`${app.base}/api/cron/tick?key=test-cron-secret`);
+    assert.equal(q.status, 200);
+    assert.equal(u.got().length, 0, 'real clock: no alerts due for these recorded events');
   } finally { await app.close(); }
 });

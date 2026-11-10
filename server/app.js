@@ -1,21 +1,21 @@
 import express from 'express';
-import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
+import fs from 'node:fs';
 import {
   hashPassword, verifyPassword, createSession, destroySession, sessionCookie,
   loadUser, requireUser, csrfGuard, rateLimit, COOKIE,
 } from './auth.js';
-import { tx } from './db.js';
-import { isValidYmd, isValidTz, startOfLocalDay, addDays, weekStart, localDate, DEFAULT_TZ } from './lib/time.js';
+import { NOW_ISO, isUniqueViolation } from './db.js';
+import { isValidYmd, isValidTz, startOfLocalDay, addDays, weekStart, localDate, tzOffsetMinutes, DEFAULT_TZ } from './lib/time.js';
 import { tradesFor, computeStats, disciplineForDay, disciplineRange, net } from './services/stats.js';
 import { parseMt5Csv } from './services/mt5.js';
 import { calendarStatus, presentEvent, queryEvents, syncCalendar } from './services/calendar.js';
 import { getPrefs, SUPPORTED_CURRENCIES, sendTestNotification, prefImpacts, prefCurrencies } from './services/notifications.js';
 import { isValidSubscription } from './services/push.js';
+import { runScheduledJobs } from './scheduler.js';
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
-const bad = msg => new HttpError(400, msg);
+const bad = (msg) => new HttpError(400, msg);
 const notFound = (what = 'Not found') => new HttpError(404, what);
 
 // ---- small validators -------------------------------------------------------
@@ -49,14 +49,18 @@ const mode = (v, user) => {
   if (m !== 'demo' && m !== 'live') throw bad('mode must be demo or live');
   return m;
 };
-const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+/** Route ids must be positive integers; anything else is simply "not found". */
+const idOf = (v) => (/^\d{1,15}$/.test(String(v)) ? Number(v) : -1);
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const IMAGE_SIGS = [
-  { mime: 'image/png', ext: 'png', test: b => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
-  { mime: 'image/jpeg', ext: 'jpg', test: b => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
-  { mime: 'image/webp', ext: 'webp', test: b => b.subarray(0, 4).toString() === 'RIFF' && b.subarray(8, 12).toString() === 'WEBP' },
-  { mime: 'image/gif', ext: 'gif', test: b => b.subarray(0, 4).toString() === 'GIF8' },
+  { mime: 'image/png', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { mime: 'image/jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { mime: 'image/webp', test: (b) => b.subarray(0, 4).toString() === 'RIFF' && b.subarray(8, 12).toString() === 'WEBP' },
+  { mime: 'image/gif', test: (b) => b.subarray(0, 4).toString() === 'GIF8' },
 ];
+// Vercel limits request bodies to 4.5 MB; the client downsizes images before upload.
+const MAX_IMAGE = 4 * 1024 * 1024;
 
 const STARTER_CHECKLIST = [
   'Checked the economic calendar for high/medium impact news',
@@ -73,12 +77,10 @@ const STARTER_RULES = [
   ['Only take setups defined in my plan', 'execution'],
 ];
 
-export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, secureCookies = false, now = () => new Date() } = {}) {
+export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCookies = false, cronSecret, trustProxy = 'loopback', now = () => new Date() } = {}) {
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', 'loopback');
-  const uploadDir = path.join(dataDir, 'uploads');
-  fs.mkdirSync(uploadDir, { recursive: true });
+  app.set('trust proxy', trustProxy);
 
   app.use((req, res, next) => {
     res.set({
@@ -86,60 +88,77 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
       'Referrer-Policy': 'same-origin',
       'X-Frame-Options': 'DENY',
       'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-      'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; script-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+      'Content-Security-Policy': "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self'; script-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
     });
     next();
   });
+
+  // Scheduled jobs (calendar sync + notification dispatch). Called every minute by an
+  // external cron (cron-job.org) on Vercel; protected by a shared secret.
+  app.all('/api/cron/tick', wrap(async (req, res) => {
+    const auth = req.get('Authorization') || '';
+    const given = auth.startsWith('Bearer ') ? auth.slice(7) : req.query.key;
+    if (!cronSecret || given !== cronSecret) return res.status(401).json({ error: 'Unauthorized' });
+    res.json(await runScheduledJobs(db, { send: sender, fetchImpl, now: now() }));
+  }));
+
   app.use('/api', express.json({ limit: '200kb' }));
   app.use('/api', loadUser(db));
   app.use('/api', csrfGuard);
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
-  const ownAccount = (userId, id) => db.prepare('SELECT * FROM accounts WHERE id=? AND user_id=?').get(id, userId);
-  const ownTrade = (userId, id) => db.prepare('SELECT * FROM trades WHERE id=? AND user_id=?').get(id, userId);
+  const ownAccount = (userId, id) => db.get('SELECT * FROM accounts WHERE id=? AND user_id=?', idOf(id), userId);
+  const ownTrade = (userId, id) => db.get('SELECT * FROM trades WHERE id=? AND user_id=?', idOf(id), userId);
+  const count = async (sql, ...p) => (await db.get(sql, ...p)).c;
 
   // ---- auth --------------------------------------------------------------------
   const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
-  const publicUser = u => ({ id: u.id, email: u.email, displayName: u.display_name, defaultRiskPct: u.default_risk_pct, timezone: u.timezone, activeMode: u.active_mode });
+  const publicUser = (u) => ({ id: u.id, email: u.email, displayName: u.display_name, defaultRiskPct: u.default_risk_pct, timezone: u.timezone, activeMode: u.active_mode });
 
-  app.post('/api/auth/register', authLimiter, wrap((req, res) => {
+  app.post('/api/auth/register', authLimiter, wrap(async (req, res) => {
     const email = str(req.body.email, { required: true, max: 200, name: 'Email' }).toLowerCase();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw bad('Enter a valid email address');
     const pw = req.body.password;
     if (typeof pw !== 'string' || pw.length < 8 || pw.length > 200) throw bad('Password must be at least 8 characters');
     const name = str(req.body.displayName, { max: 80, name: 'Name' }) || email.split('@')[0];
-    if (db.prepare('SELECT 1 FROM users WHERE email=?').get(email)) throw new HttpError(409, 'An account with this email already exists');
-    const userId = tx(db, () => {
-      const id = Number(db.prepare('INSERT INTO users(email,password_hash,display_name) VALUES(?,?,?)').run(email, hashPassword(pw), name).lastInsertRowid);
-      db.prepare(`INSERT INTO accounts(user_id,name,type,starting_balance) VALUES (?,?,?,?)`).run(id, 'Demo account', 'demo', 10000);
-      STARTER_CHECKLIST.forEach((l, i) => db.prepare('INSERT INTO checklist_items(user_id,label,position) VALUES(?,?,?)').run(id, l, i));
-      STARTER_RULES.forEach(([r, c], i) => db.prepare('INSERT INTO trading_rules(user_id,rule,category,position) VALUES(?,?,?,?)').run(id, r, c, i));
-      db.prepare('INSERT INTO notification_prefs(user_id) VALUES(?)').run(id);
-      return id;
-    });
-    const s = createSession(db, userId);
+    if (await db.get('SELECT 1 FROM users WHERE email=?', email)) throw new HttpError(409, 'An account with this email already exists');
+    let userId;
+    try {
+      userId = await db.tx(async (t) => {
+        const id = (await t.get('INSERT INTO users(email,password_hash,display_name) VALUES(?,?,?) RETURNING id', email, hashPassword(pw), name)).id;
+        await t.run('INSERT INTO accounts(user_id,name,type,starting_balance) VALUES (?,?,?,?)', id, 'Demo account', 'demo', 10000);
+        for (const [i, l] of STARTER_CHECKLIST.entries()) await t.run('INSERT INTO checklist_items(user_id,label,position) VALUES(?,?,?)', id, l, i);
+        for (const [i, [r, c]] of STARTER_RULES.entries()) await t.run('INSERT INTO trading_rules(user_id,rule,category,position) VALUES(?,?,?,?)', id, r, c, i);
+        await t.run('INSERT INTO notification_prefs(user_id) VALUES(?)', id);
+        return id;
+      });
+    } catch (e) {
+      if (isUniqueViolation(e)) throw new HttpError(409, 'An account with this email already exists');
+      throw e;
+    }
+    const s = await createSession(db, userId);
     res.set('Set-Cookie', sessionCookie(s.token, s.maxAge, secureCookies));
-    res.status(201).json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(userId)) });
+    res.status(201).json({ user: publicUser(await db.get('SELECT * FROM users WHERE id=?', userId)) });
   }));
 
-  app.post('/api/auth/login', authLimiter, wrap((req, res) => {
+  app.post('/api/auth/login', authLimiter, wrap(async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
-    const u = db.prepare('SELECT * FROM users WHERE email=?').get(email);
+    const u = await db.get('SELECT * FROM users WHERE email=?', email);
     const ok = u && typeof req.body.password === 'string' && verifyPassword(req.body.password, u.password_hash);
     if (!ok) throw new HttpError(401, 'Incorrect email or password');
-    const s = createSession(db, u.id);
+    const s = await createSession(db, u.id);
     res.set('Set-Cookie', sessionCookie(s.token, s.maxAge, secureCookies));
     res.json({ user: publicUser(u) });
   }));
 
-  app.post('/api/auth/logout', (req, res) => {
-    destroySession(db, req.sessionToken);
-    res.set('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  app.post('/api/auth/logout', wrap(async (req, res) => {
+    await destroySession(db, req.sessionToken);
+    res.set('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookies ? '; Secure' : ''}`);
     res.json({ ok: true });
-  });
+  }));
 
   app.get('/api/me', requireUser, (req, res) => res.json({ user: publicUser(req.user) }));
-  app.patch('/api/me', requireUser, wrap((req, res) => {
+  app.patch('/api/me', requireUser, wrap(async (req, res) => {
     const b = req.body;
     const cur = req.user;
     const name = b.displayName !== undefined ? str(b.displayName, { required: true, max: 80, name: 'Name' }) : cur.display_name;
@@ -147,14 +166,22 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
     const tz = b.timezone !== undefined ? b.timezone : cur.timezone;
     if (!isValidTz(tz)) throw bad('Unknown timezone');
     const m = b.activeMode !== undefined ? mode(b.activeMode, cur) : cur.active_mode;
-    db.prepare('UPDATE users SET display_name=?, default_risk_pct=?, timezone=?, active_mode=? WHERE id=?').run(name, risk, tz, m, cur.id);
-    res.json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(cur.id)) });
+    await db.run('UPDATE users SET display_name=?, default_risk_pct=?, timezone=?, active_mode=? WHERE id=?', name, risk, tz, m, cur.id);
+    res.json({ user: publicUser(await db.get('SELECT * FROM users WHERE id=?', cur.id)) });
   }));
 
-  app.use('/api', (req, res, next) => (req.path.startsWith('/push/vapid') || req.path === '/health') ? next() : requireUser(req, res, next));
+  // Health: also reports the time-zone database so a deployment can be checked
+  // for Morocco's 2026 offset change (Africa/Casablanca must be UTC+0 in Nov 2026).
+  app.get('/api/health', (_req, res) => res.json({
+    ok: true, db: db.kind, tzdata: process.versions.tz || null,
+    casablancaOffsetNow: tzOffsetMinutes(new Date(), 'Africa/Casablanca'),
+    casablancaOffset_2026_11_10: tzOffsetMinutes(new Date('2026-11-10T12:00:00Z'), 'Africa/Casablanca'),
+  }));
+
+  app.use('/api', (req, res, next) => (req.path.startsWith('/push/vapid') ? next() : requireUser(req, res, next)));
 
   // ---- accounts -----------------------------------------------------------------
-  const accountView = a => ({ id: a.id, name: a.name, type: a.type, broker: a.broker, currency: a.currency, startingBalance: a.starting_balance, serverUtcOffsetMin: a.server_utc_offset_min });
+  const accountView = (a) => ({ id: a.id, name: a.name, type: a.type, broker: a.broker, currency: a.currency, startingBalance: a.starting_balance, serverUtcOffsetMin: a.server_utc_offset_min });
   const readAccount = (b, cur = {}) => ({
     name: b.name !== undefined ? str(b.name, { required: true, max: 80, name: 'Account name' }) : cur.name,
     type: b.type !== undefined ? (['demo', 'live'].includes(b.type) ? b.type : (() => { throw bad('Account type must be demo or live'); })()) : cur.type,
@@ -163,38 +190,36 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
     starting_balance: b.startingBalance !== undefined ? num(b.startingBalance, { min: 0, max: 1e12, required: true, name: 'Starting balance' }) : (cur.starting_balance ?? 0),
     server_utc_offset_min: b.serverUtcOffsetMin !== undefined ? num(b.serverUtcOffsetMin, { min: -720, max: 840, int: true, required: true, name: 'Server UTC offset' }) : (cur.server_utc_offset_min ?? 120),
   });
-  app.get('/api/accounts', (req, res) => {
-    res.json({ accounts: db.prepare('SELECT * FROM accounts WHERE user_id=? ORDER BY type, name').all(req.user.id).map(accountView) });
-  });
-  app.post('/api/accounts', wrap((req, res) => {
+  app.get('/api/accounts', wrap(async (req, res) => {
+    res.json({ accounts: (await db.all('SELECT * FROM accounts WHERE user_id=? ORDER BY type, name', req.user.id)).map(accountView) });
+  }));
+  app.post('/api/accounts', wrap(async (req, res) => {
     const a = readAccount(req.body);
     if (!a.type) throw bad('Account type must be demo or live');
-    const id = db.prepare('INSERT INTO accounts(user_id,name,type,broker,currency,starting_balance,server_utc_offset_min) VALUES(?,?,?,?,?,?,?)')
-      .run(req.user.id, a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min).lastInsertRowid;
-    res.status(201).json({ account: accountView(ownAccount(req.user.id, id)) });
+    const { id } = await db.get('INSERT INTO accounts(user_id,name,type,broker,currency,starting_balance,server_utc_offset_min) VALUES(?,?,?,?,?,?,?) RETURNING id',
+      req.user.id, a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min);
+    res.status(201).json({ account: accountView(await ownAccount(req.user.id, id)) });
   }));
-  app.patch('/api/accounts/:id', wrap((req, res) => {
-    const cur = ownAccount(req.user.id, req.params.id);
+  app.patch('/api/accounts/:id', wrap(async (req, res) => {
+    const cur = await ownAccount(req.user.id, req.params.id);
     if (!cur) throw notFound('Account not found');
     const a = readAccount(req.body, cur);
-    if (a.type !== cur.type && db.prepare('SELECT COUNT(*) c FROM trades WHERE account_id=?').get(cur.id).c > 0)
+    if (a.type !== cur.type && (await count('SELECT COUNT(*)::int c FROM trades WHERE account_id=?', cur.id)) > 0)
       throw bad('Cannot change Demo/Live type of an account that has trades — create a new account instead');
-    db.prepare('UPDATE accounts SET name=?, type=?, broker=?, currency=?, starting_balance=?, server_utc_offset_min=? WHERE id=? AND user_id=?')
-      .run(a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min, cur.id, req.user.id);
-    res.json({ account: accountView(ownAccount(req.user.id, cur.id)) });
+    await db.run('UPDATE accounts SET name=?, type=?, broker=?, currency=?, starting_balance=?, server_utc_offset_min=? WHERE id=? AND user_id=?',
+      a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min, cur.id, req.user.id);
+    res.json({ account: accountView(await ownAccount(req.user.id, cur.id)) });
   }));
-  app.delete('/api/accounts/:id', wrap((req, res) => {
-    const cur = ownAccount(req.user.id, req.params.id);
+  app.delete('/api/accounts/:id', wrap(async (req, res) => {
+    const cur = await ownAccount(req.user.id, req.params.id);
     if (!cur) throw notFound('Account not found');
-    const shots = db.prepare('SELECT s.file_name FROM trade_screenshots s JOIN trades t ON t.id=s.trade_id WHERE t.account_id=?').all(cur.id);
-    db.prepare('DELETE FROM accounts WHERE id=? AND user_id=?').run(cur.id, req.user.id);
-    for (const s of shots) fs.rm(path.join(uploadDir, s.file_name), { force: true }, () => {});
+    await db.run('DELETE FROM accounts WHERE id=? AND user_id=?', cur.id, req.user.id);
     res.json({ ok: true });
   }));
 
   // ---- trades -----------------------------------------------------------------
-  const shotsFor = tradeId => db.prepare('SELECT id, kind, mime, size, created_at FROM trade_screenshots WHERE trade_id=? ORDER BY id').all(tradeId);
-  const tradeView = t => ({
+  const shotsFor = (tradeId) => db.all('SELECT id, kind, mime, size, created_at FROM trade_screenshots WHERE trade_id=? ORDER BY id', tradeId);
+  const tradeView = (t) => ({
     id: t.id, accountId: t.account_id, accountName: t.account_name, accountType: t.account_type, ticket: t.ticket, source: t.source,
     symbol: t.symbol, direction: t.direction, volume: t.volume, openTime: t.open_time, closeTime: t.close_time,
     openPrice: t.open_price, closePrice: t.close_price, stopLoss: t.stop_loss, takeProfit: t.take_profit,
@@ -204,12 +229,13 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
     setup: t.setup, planFollowed: t.plan_followed === null ? null : !!t.plan_followed, emotion: t.emotion, notes: t.notes,
     corrected: !!t.corrected, createdAt: t.created_at, updatedAt: t.updated_at,
   });
-  const fullTrade = (userId, id) => db.prepare(`SELECT t.*, a.name account_name, a.type account_type FROM trades t JOIN accounts a ON a.id=t.account_id WHERE t.id=? AND t.user_id=?`).get(id, userId);
+  const fullTrade = (userId, id) => db.get('SELECT t.*, a.name account_name, a.type account_type FROM trades t JOIN accounts a ON a.id=t.account_id WHERE t.id=? AND t.user_id=?', idOf(id), userId);
 
   /** Risk amount = risk % of the account balance at entry (starting balance + realised P&L before the trade). */
-  const riskAmountFor = (account, riskPct, openTime, excludeId = null) => {
-    const prior = db.prepare(`SELECT COALESCE(SUM(COALESCE(profit,0)+commission+swap),0) s FROM trades WHERE account_id=? AND close_time IS NOT NULL AND close_time <= ? AND id IS NOT ?`).get(account.id, openTime, excludeId).s;
-    const bal = account.starting_balance + prior;
+  const riskAmountFor = async (h, account, riskPct, openTime, excludeId = null) => {
+    const { s } = await h.get(`SELECT COALESCE(SUM(COALESCE(profit,0)+commission+swap),0)::float8 s FROM trades
+                               WHERE account_id=? AND close_time IS NOT NULL AND close_time <= ? AND id IS DISTINCT FROM ?`, account.id, openTime, excludeId);
+    const bal = account.starting_balance + s;
     return bal > 0 ? Math.round(bal * riskPct) / 100 : null;
   };
 
@@ -242,240 +268,239 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
     return t;
   };
 
-  app.get('/api/trades', wrap((req, res) => {
+  app.get('/api/trades', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
     const accountId = req.query.account ? num(req.query.account, { int: true, name: 'account' }) : null;
-    if (accountId) { const a = ownAccount(req.user.id, accountId); if (!a || a.type !== m) throw notFound('Account not found in this mode'); }
+    if (accountId) { const a = await ownAccount(req.user.id, accountId); if (!a || a.type !== m) throw notFound('Account not found in this mode'); }
     const tz = req.user.timezone;
     const from = req.query.from ? startOfLocalDay(ymd(req.query.from, 'from'), tz).toISOString() : null;
     const to = req.query.to ? startOfLocalDay(addDays(ymd(req.query.to, 'to'), 1), tz).toISOString() : null;
-    let rows = tradesFor(db, req.user.id, { mode: m, accountId, from, to }).reverse();
-    if (req.query.symbol) rows = rows.filter(t => t.symbol === String(req.query.symbol).toUpperCase());
+    let rows = (await tradesFor(db, req.user.id, { mode: m, accountId, from, to })).reverse();
+    if (req.query.symbol) rows = rows.filter((t) => t.symbol === String(req.query.symbol).toUpperCase());
     res.json({ mode: m, trades: rows.map(tradeView) });
   }));
 
-  app.post('/api/trades', wrap((req, res) => {
-    const acc = ownAccount(req.user.id, req.body.accountId);
+  app.post('/api/trades', wrap(async (req, res) => {
+    const acc = await ownAccount(req.user.id, req.body.accountId);
     if (!acc) throw notFound('Account not found');
     const t = readTrade(req.body, null, req.user);
     const risk = req.body.riskAmount !== undefined && req.body.riskAmount !== null && req.body.riskAmount !== ''
-      ? num(req.body.riskAmount, { min: 0, name: 'Risk amount' }) : riskAmountFor(acc, t.risk_pct, t.open_time);
+      ? num(req.body.riskAmount, { min: 0, name: 'Risk amount' }) : await riskAmountFor(db, acc, t.risk_pct, t.open_time);
     let id;
     try {
-      id = db.prepare(`INSERT INTO trades(user_id,account_id,ticket,source,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount,setup,plan_followed,emotion,notes)
-                     VALUES(?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.id, acc.id, t.ticket, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, t.risk_pct, risk, t.setup, t.plan_followed, t.emotion, t.notes).lastInsertRowid;
+      ({ id } = await db.get(`INSERT INTO trades(user_id,account_id,ticket,source,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount,setup,plan_followed,emotion,notes)
+                     VALUES(?,?,?,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+      req.user.id, acc.id, t.ticket, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, t.risk_pct, risk, t.setup, t.plan_followed, t.emotion, t.notes));
     } catch (e) {
-      if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'A trade with this ticket already exists in this account');
+      if (isUniqueViolation(e)) throw new HttpError(409, 'A trade with this ticket already exists in this account');
       throw e;
     }
-    res.status(201).json({ trade: { ...tradeView(fullTrade(req.user.id, id)), screenshots: [] } });
+    res.status(201).json({ trade: { ...tradeView(await fullTrade(req.user.id, id)), screenshots: [] } });
   }));
 
-  app.get('/api/trades/:id', wrap((req, res) => {
-    const t = fullTrade(req.user.id, req.params.id);
+  app.get('/api/trades/:id', wrap(async (req, res) => {
+    const t = await fullTrade(req.user.id, req.params.id);
     if (!t) throw notFound('Trade not found');
-    res.json({ trade: { ...tradeView(t), screenshots: shotsFor(t.id) } });
+    res.json({ trade: { ...tradeView(t), screenshots: await shotsFor(t.id) } });
   }));
 
-  app.patch('/api/trades/:id', wrap((req, res) => {
-    const cur = ownTrade(req.user.id, req.params.id);
+  app.patch('/api/trades/:id', wrap(async (req, res) => {
+    const cur = await ownTrade(req.user.id, req.params.id);
     if (!cur) throw notFound('Trade not found');
     let accountId = cur.account_id;
     if (req.body.accountId !== undefined && Number(req.body.accountId) !== cur.account_id) {
-      const a = ownAccount(req.user.id, req.body.accountId);
+      const a = await ownAccount(req.user.id, req.body.accountId);
       if (!a) throw notFound('Account not found');
-      const old = ownAccount(req.user.id, cur.account_id);
+      const old = await ownAccount(req.user.id, cur.account_id);
       if (a.type !== old.type) throw bad('Cannot move a trade between Demo and Live accounts');
       accountId = a.id;
     }
     const t = readTrade(req.body, cur, req.user);
-    const acc = ownAccount(req.user.id, accountId);
+    const acc = await ownAccount(req.user.id, accountId);
     let risk = cur.risk_amount;
     if (req.body.riskAmount !== undefined) risk = num(req.body.riskAmount, { min: 0, name: 'Risk amount' });
-    else if (req.body.riskPct !== undefined || req.body.openTime !== undefined) risk = riskAmountFor(acc, t.risk_pct, t.open_time, cur.id);
+    else if (req.body.riskPct !== undefined || req.body.openTime !== undefined) risk = await riskAmountFor(db, acc, t.risk_pct, t.open_time, cur.id);
     // Editing any market data of an imported trade marks it as a manual correction.
     const marketFields = ['symbol', 'direction', 'volume', 'openTime', 'closeTime', 'openPrice', 'closePrice', 'stopLoss', 'takeProfit', 'commission', 'swap', 'profit'];
-    const corrected = cur.corrected || (cur.source === 'mt5_csv' && marketFields.some(f => req.body[f] !== undefined)) ? 1 : 0;
+    const corrected = cur.corrected || (cur.source === 'mt5_csv' && marketFields.some((f) => req.body[f] !== undefined)) ? 1 : 0;
     try {
-      db.prepare(`UPDATE trades SET account_id=?, ticket=?, symbol=?, direction=?, volume=?, open_time=?, close_time=?, open_price=?, close_price=?, stop_loss=?, take_profit=?, commission=?, swap=?, profit=?, risk_pct=?, risk_amount=?, setup=?, plan_followed=?, emotion=?, notes=?, corrected=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND user_id=?`)
-        .run(accountId, t.ticket, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, t.risk_pct, risk, t.setup, t.plan_followed, t.emotion, t.notes, corrected, cur.id, req.user.id);
+      await db.run(`UPDATE trades SET account_id=?, ticket=?, symbol=?, direction=?, volume=?, open_time=?, close_time=?, open_price=?, close_price=?, stop_loss=?, take_profit=?, commission=?, swap=?, profit=?, risk_pct=?, risk_amount=?, setup=?, plan_followed=?, emotion=?, notes=?, corrected=?, updated_at=${NOW_ISO} WHERE id=? AND user_id=?`,
+        accountId, t.ticket, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, t.risk_pct, risk, t.setup, t.plan_followed, t.emotion, t.notes, corrected, cur.id, req.user.id);
     } catch (e) {
-      if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'A trade with this ticket already exists in this account');
+      if (isUniqueViolation(e)) throw new HttpError(409, 'A trade with this ticket already exists in this account');
       throw e;
     }
-    res.json({ trade: { ...tradeView(fullTrade(req.user.id, cur.id)), screenshots: shotsFor(cur.id) } });
+    res.json({ trade: { ...tradeView(await fullTrade(req.user.id, cur.id)), screenshots: await shotsFor(cur.id) } });
   }));
 
-  app.delete('/api/trades/:id', wrap((req, res) => {
-    const cur = ownTrade(req.user.id, req.params.id);
+  app.delete('/api/trades/:id', wrap(async (req, res) => {
+    const cur = await ownTrade(req.user.id, req.params.id);
     if (!cur) throw notFound('Trade not found');
-    const shots = db.prepare('SELECT file_name FROM trade_screenshots WHERE trade_id=?').all(cur.id);
-    db.prepare('DELETE FROM trades WHERE id=? AND user_id=?').run(cur.id, req.user.id);
-    for (const s of shots) fs.rm(path.join(uploadDir, s.file_name), { force: true }, () => {});
+    await db.run('DELETE FROM trades WHERE id=? AND user_id=?', cur.id, req.user.id);
     res.json({ ok: true });
   }));
 
-  // Screenshots: raw image body, content sniffed by magic bytes, stored outside the web root.
-  app.post('/api/trades/:id/screenshots', express.raw({ type: () => true, limit: '6mb' }), wrap((req, res) => {
-    const cur = ownTrade(req.user.id, req.params.id);
+  // Screenshots: raw image body, content sniffed by magic bytes, stored in the database.
+  app.post('/api/trades/:id/screenshots', express.raw({ type: () => true, limit: '4.4mb' }), wrap(async (req, res) => {
+    const cur = await ownTrade(req.user.id, req.params.id);
     if (!cur) throw notFound('Trade not found');
     const kind = req.query.kind;
     if (!['before', 'after'].includes(kind)) throw bad('kind must be before or after');
     const buf = req.body;
     if (!Buffer.isBuffer(buf) || buf.length < 16) throw bad('No image received');
-    if (buf.length > 5 * 1024 * 1024) throw bad('Image must be 5 MB or smaller');
-    const sig = IMAGE_SIGS.find(s => s.test(buf));
+    if (buf.length > MAX_IMAGE) throw bad('Image must be 4 MB or smaller');
+    const sig = IMAGE_SIGS.find((s) => s.test(buf));
     if (!sig) throw bad('Only PNG, JPEG, WebP or GIF images are accepted');
-    if (db.prepare('SELECT COUNT(*) c FROM trade_screenshots WHERE trade_id=?').get(cur.id).c >= 10) throw bad('Maximum 10 screenshots per trade');
-    const fileName = `${req.user.id}-${cur.id}-${crypto.randomBytes(12).toString('hex')}.${sig.ext}`;
-    fs.writeFileSync(path.join(uploadDir, fileName), buf);
-    const id = db.prepare('INSERT INTO trade_screenshots(trade_id,user_id,kind,file_name,mime,size) VALUES(?,?,?,?,?,?)').run(cur.id, req.user.id, kind, fileName, sig.mime, buf.length).lastInsertRowid;
-    res.status(201).json({ screenshot: db.prepare('SELECT id, kind, mime, size, created_at FROM trade_screenshots WHERE id=?').get(id) });
+    if ((await count('SELECT COUNT(*)::int c FROM trade_screenshots WHERE trade_id=?', cur.id)) >= 10) throw bad('Maximum 10 screenshots per trade');
+    const row = await db.get('INSERT INTO trade_screenshots(trade_id,user_id,kind,mime,size,data) VALUES(?,?,?,?,?,?) RETURNING id, kind, mime, size, created_at',
+      cur.id, req.user.id, kind, sig.mime, buf.length, buf);
+    res.status(201).json({ screenshot: row });
   }));
-  app.get('/api/screenshots/:id', wrap((req, res) => {
-    const s = db.prepare('SELECT * FROM trade_screenshots WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
+  app.get('/api/screenshots/:id', wrap(async (req, res) => {
+    const s = await db.get('SELECT mime, data FROM trade_screenshots WHERE id=? AND user_id=?', idOf(req.params.id), req.user.id);
     if (!s) throw notFound('Screenshot not found');
     res.set({ 'Content-Type': s.mime, 'Cache-Control': 'private, max-age=3600', 'Content-Disposition': 'inline' });
-    res.sendFile(path.join(uploadDir, s.file_name));
+    res.end(Buffer.from(s.data));
   }));
-  app.delete('/api/screenshots/:id', wrap((req, res) => {
-    const s = db.prepare('SELECT * FROM trade_screenshots WHERE id=? AND user_id=?').get(req.params.id, req.user.id);
-    if (!s) throw notFound('Screenshot not found');
-    db.prepare('DELETE FROM trade_screenshots WHERE id=?').run(s.id);
-    fs.rm(path.join(uploadDir, s.file_name), { force: true }, () => {});
+  app.delete('/api/screenshots/:id', wrap(async (req, res) => {
+    const r = await db.run('DELETE FROM trade_screenshots WHERE id=? AND user_id=?', idOf(req.params.id), req.user.id);
+    if (!r.changes) throw notFound('Screenshot not found');
     res.json({ ok: true });
   }));
 
   // ---- MT5 CSV import ---------------------------------------------------------
-  const rawCsv = express.raw({ type: () => true, limit: '10mb' });
-  const analyseImport = (req) => {
-    const acc = ownAccount(req.user.id, req.query.account);
+  const rawCsv = express.raw({ type: () => true, limit: '4.4mb' });
+  const analyseImport = async (req) => {
+    const acc = await ownAccount(req.user.id, req.query.account);
     if (!acc) throw notFound('Choose one of your accounts to import into');
     if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw bad('The file is empty');
     const parsed = parseMt5Csv(req.body, { serverOffsetMin: acc.server_utc_offset_min });
     if (!parsed.ok) throw bad(parsed.error);
-    const exists = db.prepare('SELECT id FROM trades WHERE account_id=? AND ticket=?');
-    for (const r of parsed.rows) {
-      r.duplicate = !r.errors.length && r.trade.ticket ? !!exists.get(acc.id, r.trade.ticket) : false;
-    }
+    const tickets = parsed.rows.filter((r) => !r.errors.length && r.trade.ticket).map((r) => r.trade.ticket);
+    const existing = new Set(tickets.length
+      ? (await db.all(`SELECT ticket FROM trades WHERE account_id=? AND ticket IN (${tickets.map(() => '?').join(',')})`, acc.id, ...tickets)).map((r) => r.ticket)
+      : []);
+    for (const r of parsed.rows) r.duplicate = !r.errors.length && existing.has(r.trade.ticket);
     return { acc, parsed };
   };
-  app.post('/api/imports/preview', rawCsv, wrap((req, res) => {
-    const { acc, parsed } = analyseImport(req);
-    const dup = parsed.rows.filter(r => r.duplicate).length;
+  app.post('/api/imports/preview', rawCsv, wrap(async (req, res) => {
+    const { acc, parsed } = await analyseImport(req);
+    const dup = parsed.rows.filter((r) => r.duplicate).length;
     res.json({
       account: accountView(acc), format: parsed.format, delimiter: parsed.delimiter,
       summary: { ...parsed.summary, duplicates: dup, toImport: parsed.summary.valid - dup },
       rows: parsed.rows.slice(0, 1000),
     });
   }));
-  app.post('/api/imports/commit', rawCsv, wrap((req, res) => {
-    const { acc, parsed } = analyseImport(req);
+  app.post('/api/imports/commit', rawCsv, wrap(async (req, res) => {
+    const { acc, parsed } = await analyseImport(req);
     const fileName = (str(req.get('X-File-Name') ? decodeURIComponent(req.get('X-File-Name')) : 'import.csv', { max: 200, name: 'File name' }) || 'import.csv').replace(/[^\w.\- ]/g, '_');
-    const toImport = parsed.rows.filter(r => !r.errors.length && !r.duplicate);
+    const toImport = parsed.rows.filter((r) => !r.errors.length && !r.duplicate);
     if (!toImport.length) throw bad(parsed.summary.valid ? 'All valid rows were already imported into this account' : 'No valid rows to import');
-    const result = tx(db, () => {
-      const importId = Number(db.prepare('INSERT INTO imports(user_id,account_id,file_name,rows_total,rows_imported,rows_duplicate,rows_invalid) VALUES(?,?,?,?,?,?,?)')
-        .run(req.user.id, acc.id, fileName, parsed.rows.length, 0, parsed.rows.filter(r => r.duplicate).length, parsed.summary.invalid).lastInsertRowid);
-      const ins = db.prepare(`INSERT OR IGNORE INTO trades(user_id,account_id,ticket,source,import_id,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount)
-                              VALUES(?,?,?,'mt5_csv',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const dupCount = parsed.rows.filter((r) => r.duplicate).length;
+    const result = await db.tx(async (t) => {
+      const importId = (await t.get('INSERT INTO imports(user_id,account_id,file_name,rows_total,rows_imported,rows_duplicate,rows_invalid) VALUES(?,?,?,?,?,?,?) RETURNING id',
+        req.user.id, acc.id, fileName, parsed.rows.length, 0, dupCount, parsed.summary.invalid)).id;
       let n = 0;
       // Insert in chronological order so each trade's risk amount uses the balance at its entry.
       for (const r of [...toImport].sort((a, b) => a.trade.open_time.localeCompare(b.trade.open_time))) {
-        const t = r.trade;
-        const risk = riskAmountFor(acc, req.user.default_risk_pct, t.open_time);
-        n += ins.run(req.user.id, acc.id, t.ticket, importId, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, req.user.default_risk_pct, risk).changes;
+        const x = r.trade;
+        const risk = await riskAmountFor(t, acc, req.user.default_risk_pct, x.open_time);
+        n += (await t.run(`INSERT INTO trades(user_id,account_id,ticket,source,import_id,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount)
+                           VALUES(?,?,?,'mt5_csv',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (account_id, ticket) DO NOTHING`,
+        req.user.id, acc.id, x.ticket, importId, x.symbol, x.direction, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, req.user.default_risk_pct, risk)).changes;
       }
-      db.prepare('UPDATE imports SET rows_imported=? WHERE id=?').run(n, importId);
+      await t.run('UPDATE imports SET rows_imported=? WHERE id=?', n, importId);
       return { importId, imported: n };
     });
-    res.status(201).json({ ...result, duplicates: parsed.rows.filter(r => r.duplicate).length, invalid: parsed.summary.invalid });
+    res.status(201).json({ ...result, duplicates: dupCount, invalid: parsed.summary.invalid });
   }));
-  app.get('/api/imports', (req, res) => {
-    res.json({ imports: db.prepare(`SELECT i.*, a.name account_name, a.type account_type FROM imports i JOIN accounts a ON a.id=i.account_id WHERE i.user_id=? ORDER BY i.id DESC LIMIT 50`).all(req.user.id) });
-  });
+  app.get('/api/imports', wrap(async (req, res) => {
+    res.json({ imports: await db.all('SELECT i.*, a.name account_name, a.type account_type FROM imports i JOIN accounts a ON a.id=i.account_id WHERE i.user_id=? ORDER BY i.id DESC LIMIT 50', req.user.id) });
+  }));
 
   // ---- stats & dashboard ------------------------------------------------------
   const rangeFromQuery = (q, tz) => ({
     from: q.from ? startOfLocalDay(ymd(q.from, 'from'), tz).toISOString() : null,
     to: q.to ? startOfLocalDay(addDays(ymd(q.to, 'to'), 1), tz).toISOString() : null,
   });
-  app.get('/api/stats', wrap((req, res) => {
+  const dayRange = (d, tz) => ({ from: startOfLocalDay(d, tz).toISOString(), to: startOfLocalDay(addDays(d, 1), tz).toISOString() });
+
+  app.get('/api/stats', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
     const { from, to } = rangeFromQuery(req.query, req.user.timezone);
-    const accountId = req.query.account ? Number(req.query.account) : null;
-    if (accountId) { const a = ownAccount(req.user.id, accountId); if (!a || a.type !== m) throw notFound('Account not found in this mode'); }
-    res.json({ mode: m, stats: computeStats(tradesFor(db, req.user.id, { mode: m, from, to, accountId }), req.user.timezone) });
+    const accountId = req.query.account ? idOf(req.query.account) : null;
+    if (accountId) { const a = await ownAccount(req.user.id, accountId); if (!a || a.type !== m) throw notFound('Account not found in this mode'); }
+    res.json({ mode: m, stats: computeStats(await tradesFor(db, req.user.id, { mode: m, from, to, accountId }), req.user.timezone) });
   }));
 
-  app.get('/api/dashboard', wrap((req, res) => {
+  app.get('/api/dashboard', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
     const tz = req.user.timezone;
     const n = now();
     const today = localDate(n, tz);
-    const all = computeStats(tradesFor(db, req.user.id, { mode: m }), tz);
-    const todayStats = computeStats(tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(today, tz).toISOString(), to: startOfLocalDay(addDays(today, 1), tz).toISOString() }), tz);
+    const allTrades = await tradesFor(db, req.user.id, { mode: m });
+    const all = computeStats(allTrades, tz);
+    const todayStats = computeStats(await tradesFor(db, req.user.id, { mode: m, ...dayRange(today, tz) }), tz);
     const ws = weekStart(today);
-    const weekStats = computeStats(tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(ws, tz).toISOString(), to: startOfLocalDay(addDays(ws, 7), tz).toISOString() }), tz);
-    const accounts = db.prepare('SELECT * FROM accounts WHERE user_id=? AND type=?').all(req.user.id, m);
+    const weekStats = computeStats(await tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(ws, tz).toISOString(), to: startOfLocalDay(addDays(ws, 7), tz).toISOString() }), tz);
+    const accounts = await db.all('SELECT * FROM accounts WHERE user_id=? AND type=?', req.user.id, m);
     const startBal = accounts.reduce((a, x) => a + x.starting_balance, 0);
-    const plan = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, today);
-    const items = db.prepare('SELECT COUNT(*) c FROM checklist_items WHERE user_id=? AND active=1').get(req.user.id).c;
-    const checked = db.prepare('SELECT COUNT(*) c FROM checklist_checks cc JOIN checklist_items ci ON ci.id=cc.item_id WHERE cc.user_id=? AND cc.check_date=? AND cc.checked=1 AND ci.active=1').get(req.user.id, today).c;
-    const prefs = getPrefs(db, req.user.id);
-    const upcoming = queryEvents(db, { from: n.toISOString(), to: new Date(n.getTime() + 48 * 3600e3).toISOString(), impacts: prefImpacts(prefs).length ? prefImpacts(prefs) : ['high', 'medium'], currencies: prefCurrencies(prefs) })
-      .slice(0, 6).map(e => presentEvent(e, tz, n));
-    const disc = disciplineRange(db, req.user, addDays(today, -13), today, m);
-    const recent = tradesFor(db, req.user.id, { mode: m }).reverse().slice(0, 5).map(tradeView);
+    const plan = await db.get('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?', req.user.id, today);
+    const items = await count('SELECT COUNT(*)::int c FROM checklist_items WHERE user_id=? AND active=1', req.user.id);
+    const checked = await count('SELECT COUNT(*)::int c FROM checklist_checks cc JOIN checklist_items ci ON ci.id=cc.item_id WHERE cc.user_id=? AND cc.check_date=? AND cc.checked=1 AND ci.active=1', req.user.id, today);
+    const prefs = await getPrefs(db, req.user.id);
+    const upcoming = (await queryEvents(db, { from: n.toISOString(), to: new Date(n.getTime() + 48 * 3600e3).toISOString(), impacts: prefImpacts(prefs).length ? prefImpacts(prefs) : ['high', 'medium'], currencies: prefCurrencies(prefs) }))
+      .slice(0, 6).map((e) => presentEvent(e, tz, n));
+    const disc = await disciplineRange(db, req.user, addDays(today, -13), today, m);
     res.json({
       mode: m, today, timezone: tz,
       balance: { starting: startBal, current: Math.round((startBal + (all.netPnl || 0)) * 100) / 100, accounts: accounts.length },
       stats: all, todayStats, weekStats,
       plan: { exists: !!plan, reviewed: !!plan?.reviewed_at, checklistDone: checked, checklistTotal: items, maxTrades: plan?.max_trades ?? null },
-      upcomingNews: upcoming, calendar: calendarStatus(db, n),
-      discipline: { today: disc.days[disc.days.length - 1], average: disc.average, streak: disc.disciplinedStreak, series: disc.days.map(d => ({ date: d.date, score: d.score })) },
-      recentTrades: recent,
+      upcomingNews: upcoming, calendar: await calendarStatus(db, n),
+      discipline: { today: disc.days[disc.days.length - 1], average: disc.average, streak: disc.disciplinedStreak, series: disc.days.map((d) => ({ date: d.date, score: d.score })) },
+      recentTrades: [...allTrades].reverse().slice(0, 5).map(tradeView),
     });
   }));
 
   // ---- planner ----------------------------------------------------------------
-  const planView = p => p && ({
+  const planView = (p) => p && ({
     date: p.plan_date, marketBias: p.market_bias, keyLevels: p.key_levels, pairsToWatch: p.pairs_to_watch, newsToWatch: p.news_to_watch,
     goals: p.goals, maxTrades: p.max_trades, maxDailyLossPct: p.max_daily_loss_pct, mentalState: p.mental_state,
     review: { followedPlan: p.review_followed_plan === null ? null : !!p.review_followed_plan, wentWell: p.review_went_well, mistakes: p.review_mistakes, lessons: p.review_lessons, rating: p.review_rating, reviewedAt: p.reviewed_at },
     updatedAt: p.updated_at,
   });
-  const checklistFor = (userId, date) => db.prepare(`SELECT ci.id, ci.label, ci.position, COALESCE(cc.checked,0) checked FROM checklist_items ci
-      LEFT JOIN checklist_checks cc ON cc.item_id=ci.id AND cc.check_date=? WHERE ci.user_id=? AND ci.active=1 ORDER BY ci.position, ci.id`).all(date, userId)
-    .map(r => ({ ...r, checked: !!r.checked }));
-  const rulesFor = (userId, date) => db.prepare(`SELECT r.id, r.rule, r.category, ra.followed FROM trading_rules r
-      LEFT JOIN rule_adherence ra ON ra.rule_id=r.id AND ra.review_date=? WHERE r.user_id=? AND r.active=1 ORDER BY r.position, r.id`).all(date, userId)
-    .map(r => ({ ...r, followed: r.followed === null ? null : !!r.followed }));
+  const getPlan = (userId, d) => db.get('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?', userId, d);
+  const checklistFor = async (userId, date) => (await db.all(`SELECT ci.id, ci.label, ci.position, COALESCE(cc.checked,0) checked FROM checklist_items ci
+      LEFT JOIN checklist_checks cc ON cc.item_id=ci.id AND cc.check_date=? WHERE ci.user_id=? AND ci.active=1 ORDER BY ci.position, ci.id`, date, userId))
+    .map((r) => ({ ...r, checked: !!r.checked }));
+  const rulesFor = async (userId, date) => (await db.all(`SELECT r.id, r.rule, r.category, ra.followed FROM trading_rules r
+      LEFT JOIN rule_adherence ra ON ra.rule_id=r.id AND ra.review_date=? WHERE r.user_id=? AND r.active=1 ORDER BY r.position, r.id`, date, userId))
+    .map((r) => ({ ...r, followed: r.followed === null ? null : !!r.followed }));
 
-  app.get('/api/plans', wrap((req, res) => {
+  app.get('/api/plans', wrap(async (req, res) => {
     const from = ymd(req.query.from, 'from'), to = ymd(req.query.to, 'to');
-    res.json({ plans: db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date BETWEEN ? AND ? ORDER BY plan_date DESC').all(req.user.id, from, to).map(planView) });
+    res.json({ plans: (await db.all('SELECT * FROM daily_plans WHERE user_id=? AND plan_date BETWEEN ? AND ? ORDER BY plan_date DESC', req.user.id, from, to)).map(planView) });
   }));
-  app.get('/api/plans/:date', wrap((req, res) => {
+  app.get('/api/plans/:date', wrap(async (req, res) => {
     const d = ymd(req.params.date);
-    const p = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, d);
-    res.json({ plan: planView(p) || null, checklist: checklistFor(req.user.id, d), rules: rulesFor(req.user.id, d) });
+    res.json({ plan: planView(await getPlan(req.user.id, d)) || null, checklist: await checklistFor(req.user.id, d), rules: await rulesFor(req.user.id, d) });
   }));
-  app.put('/api/plans/:date', wrap((req, res) => {
+  app.put('/api/plans/:date', wrap(async (req, res) => {
     const d = ymd(req.params.date);
     const b = req.body;
-    const cur = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, d) || {};
+    const cur = (await getPlan(req.user.id, d)) || {};
     const pick = (k, col, fn) => (b[k] !== undefined ? fn(b[k]) : cur[col] ?? null);
     const v = {
-      market_bias: pick('marketBias', 'market_bias', x => str(x, { max: 2000, name: 'Market bias' })),
-      key_levels: pick('keyLevels', 'key_levels', x => str(x, { max: 4000, name: 'Key levels' })),
-      pairs_to_watch: pick('pairsToWatch', 'pairs_to_watch', x => str(x, { max: 500, name: 'Pairs to watch' })),
-      news_to_watch: pick('newsToWatch', 'news_to_watch', x => str(x, { max: 2000, name: 'News to watch' })),
-      goals: pick('goals', 'goals', x => str(x, { max: 2000, name: 'Goals' })),
-      max_trades: pick('maxTrades', 'max_trades', x => num(x, { min: 0, max: 100, int: true, name: 'Max trades' })),
-      max_daily_loss_pct: pick('maxDailyLossPct', 'max_daily_loss_pct', x => num(x, { min: 0, max: 100, name: 'Max daily loss %' })),
-      mental_state: pick('mentalState', 'mental_state', x => num(x, { min: 1, max: 5, int: true, name: 'Mental state' })),
+      market_bias: pick('marketBias', 'market_bias', (x) => str(x, { max: 2000, name: 'Market bias' })),
+      key_levels: pick('keyLevels', 'key_levels', (x) => str(x, { max: 4000, name: 'Key levels' })),
+      pairs_to_watch: pick('pairsToWatch', 'pairs_to_watch', (x) => str(x, { max: 500, name: 'Pairs to watch' })),
+      news_to_watch: pick('newsToWatch', 'news_to_watch', (x) => str(x, { max: 2000, name: 'News to watch' })),
+      goals: pick('goals', 'goals', (x) => str(x, { max: 2000, name: 'Goals' })),
+      max_trades: pick('maxTrades', 'max_trades', (x) => num(x, { min: 0, max: 100, int: true, name: 'Max trades' })),
+      max_daily_loss_pct: pick('maxDailyLossPct', 'max_daily_loss_pct', (x) => num(x, { min: 0, max: 100, name: 'Max daily loss %' })),
+      mental_state: pick('mentalState', 'mental_state', (x) => num(x, { min: 1, max: 5, int: true, name: 'Mental state' })),
     };
     const r = b.review || {};
     const rv = {
@@ -485,216 +510,213 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
       review_lessons: r.lessons !== undefined ? str(r.lessons, { max: 4000, name: 'Lessons' }) : cur.review_lessons ?? null,
       review_rating: r.rating !== undefined ? num(r.rating, { min: 1, max: 5, int: true, name: 'Rating' }) : cur.review_rating ?? null,
     };
-    const reviewedAt = b.review && (r.complete === true) ? new Date().toISOString() : (cur.reviewed_at ?? null);
-    tx(db, () => {
-      db.prepare(`INSERT INTO daily_plans(user_id,plan_date,market_bias,key_levels,pairs_to_watch,news_to_watch,goals,max_trades,max_daily_loss_pct,mental_state,review_followed_plan,review_went_well,review_mistakes,review_lessons,review_rating,reviewed_at)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(user_id,plan_date) DO UPDATE SET market_bias=excluded.market_bias, key_levels=excluded.key_levels, pairs_to_watch=excluded.pairs_to_watch,
-                    news_to_watch=excluded.news_to_watch, goals=excluded.goals, max_trades=excluded.max_trades, max_daily_loss_pct=excluded.max_daily_loss_pct,
-                    mental_state=excluded.mental_state, review_followed_plan=excluded.review_followed_plan, review_went_well=excluded.review_went_well,
-                    review_mistakes=excluded.review_mistakes, review_lessons=excluded.review_lessons, review_rating=excluded.review_rating,
-                    reviewed_at=excluded.reviewed_at, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`)
-        .run(req.user.id, d, v.market_bias, v.key_levels, v.pairs_to_watch, v.news_to_watch, v.goals, v.max_trades, v.max_daily_loss_pct, v.mental_state,
-          rv.review_followed_plan, rv.review_went_well, rv.review_mistakes, rv.review_lessons, rv.review_rating, reviewedAt);
-      if (b.review?.rules && typeof b.review.rules === 'object') {
-        for (const [ruleId, followed] of Object.entries(b.review.rules)) {
-          const rule = db.prepare('SELECT id FROM trading_rules WHERE id=? AND user_id=?').get(ruleId, req.user.id);
-          if (!rule) throw bad('Unknown rule');
-          if (followed === null) db.prepare('DELETE FROM rule_adherence WHERE rule_id=? AND review_date=?').run(rule.id, d);
-          else db.prepare('INSERT INTO rule_adherence(user_id,rule_id,review_date,followed) VALUES(?,?,?,?) ON CONFLICT(rule_id,review_date) DO UPDATE SET followed=excluded.followed').run(req.user.id, rule.id, d, bool01(followed, 'followed'));
-        }
+    const reviewedAt = b.review && r.complete === true ? new Date().toISOString() : (cur.reviewed_at ?? null);
+    // Validate rule ownership before writing anything.
+    const ruleEntries = b.review?.rules && typeof b.review.rules === 'object' ? Object.entries(b.review.rules) : [];
+    for (const [ruleId, followed] of ruleEntries) {
+      if (!(await db.get('SELECT 1 FROM trading_rules WHERE id=? AND user_id=?', idOf(ruleId), req.user.id))) throw bad('Unknown rule');
+      if (followed !== null) bool01(followed, 'followed');
+    }
+    await db.tx(async (t) => {
+      await t.run(`INSERT INTO daily_plans(user_id,plan_date,market_bias,key_levels,pairs_to_watch,news_to_watch,goals,max_trades,max_daily_loss_pct,mental_state,review_followed_plan,review_went_well,review_mistakes,review_lessons,review_rating,reviewed_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(user_id,plan_date) DO UPDATE SET market_bias=excluded.market_bias, key_levels=excluded.key_levels, pairs_to_watch=excluded.pairs_to_watch,
+                     news_to_watch=excluded.news_to_watch, goals=excluded.goals, max_trades=excluded.max_trades, max_daily_loss_pct=excluded.max_daily_loss_pct,
+                     mental_state=excluded.mental_state, review_followed_plan=excluded.review_followed_plan, review_went_well=excluded.review_went_well,
+                     review_mistakes=excluded.review_mistakes, review_lessons=excluded.review_lessons, review_rating=excluded.review_rating,
+                     reviewed_at=excluded.reviewed_at, updated_at=${NOW_ISO}`,
+      req.user.id, d, v.market_bias, v.key_levels, v.pairs_to_watch, v.news_to_watch, v.goals, v.max_trades, v.max_daily_loss_pct, v.mental_state,
+      rv.review_followed_plan, rv.review_went_well, rv.review_mistakes, rv.review_lessons, rv.review_rating, reviewedAt);
+      for (const [ruleId, followed] of ruleEntries) {
+        if (followed === null) await t.run('DELETE FROM rule_adherence WHERE rule_id=? AND review_date=?', idOf(ruleId), d);
+        else await t.run('INSERT INTO rule_adherence(user_id,rule_id,review_date,followed) VALUES(?,?,?,?) ON CONFLICT(rule_id,review_date) DO UPDATE SET followed=excluded.followed', req.user.id, idOf(ruleId), d, bool01(followed, 'followed'));
       }
     });
-    const p = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, d);
-    res.json({ plan: planView(p), checklist: checklistFor(req.user.id, d), rules: rulesFor(req.user.id, d) });
+    res.json({ plan: planView(await getPlan(req.user.id, d)), checklist: await checklistFor(req.user.id, d), rules: await rulesFor(req.user.id, d) });
   }));
-  app.delete('/api/plans/:date', wrap((req, res) => {
-    db.prepare('DELETE FROM daily_plans WHERE user_id=? AND plan_date=?').run(req.user.id, ymd(req.params.date));
+  app.delete('/api/plans/:date', wrap(async (req, res) => {
+    await db.run('DELETE FROM daily_plans WHERE user_id=? AND plan_date=?', req.user.id, ymd(req.params.date));
     res.json({ ok: true });
   }));
 
-  app.put('/api/checklist/:date/:itemId', wrap((req, res) => {
+  app.put('/api/checklist/:date/:itemId', wrap(async (req, res) => {
     const d = ymd(req.params.date);
-    const item = db.prepare('SELECT id FROM checklist_items WHERE id=? AND user_id=?').get(req.params.itemId, req.user.id);
+    const item = await db.get('SELECT id FROM checklist_items WHERE id=? AND user_id=?', idOf(req.params.itemId), req.user.id);
     if (!item) throw notFound('Checklist item not found');
     const c = bool01(req.body.checked, 'checked') ?? 0;
-    db.prepare('INSERT INTO checklist_checks(user_id,item_id,check_date,checked) VALUES(?,?,?,?) ON CONFLICT(item_id,check_date) DO UPDATE SET checked=excluded.checked').run(req.user.id, item.id, d, c);
-    res.json({ checklist: checklistFor(req.user.id, d) });
+    await db.run('INSERT INTO checklist_checks(user_id,item_id,check_date,checked) VALUES(?,?,?,?) ON CONFLICT(item_id,check_date) DO UPDATE SET checked=excluded.checked', req.user.id, item.id, d, c);
+    res.json({ checklist: await checklistFor(req.user.id, d) });
   }));
-  app.get('/api/checklist/items', (req, res) => res.json({ items: db.prepare('SELECT id,label,position FROM checklist_items WHERE user_id=? AND active=1 ORDER BY position,id').all(req.user.id) }));
-  app.post('/api/checklist/items', wrap((req, res) => {
+  app.get('/api/checklist/items', wrap(async (req, res) => res.json({ items: await db.all('SELECT id,label,position FROM checklist_items WHERE user_id=? AND active=1 ORDER BY position,id', req.user.id) })));
+  app.post('/api/checklist/items', wrap(async (req, res) => {
     const label = str(req.body.label, { required: true, max: 200, name: 'Checklist item' });
-    const pos = db.prepare('SELECT COALESCE(MAX(position),0)+1 p FROM checklist_items WHERE user_id=?').get(req.user.id).p;
-    const id = db.prepare('INSERT INTO checklist_items(user_id,label,position) VALUES(?,?,?)').run(req.user.id, label, pos).lastInsertRowid;
-    res.status(201).json({ item: db.prepare('SELECT id,label,position FROM checklist_items WHERE id=?').get(id) });
+    const { p } = await db.get('SELECT COALESCE(MAX(position),0)+1 p FROM checklist_items WHERE user_id=?', req.user.id);
+    const item = await db.get('INSERT INTO checklist_items(user_id,label,position) VALUES(?,?,?) RETURNING id,label,position', req.user.id, label, p);
+    res.status(201).json({ item });
   }));
-  app.patch('/api/checklist/items/:id', wrap((req, res) => {
-    const it = db.prepare('SELECT * FROM checklist_items WHERE id=? AND user_id=? AND active=1').get(req.params.id, req.user.id);
+  app.patch('/api/checklist/items/:id', wrap(async (req, res) => {
+    const it = await db.get('SELECT * FROM checklist_items WHERE id=? AND user_id=? AND active=1', idOf(req.params.id), req.user.id);
     if (!it) throw notFound('Checklist item not found');
     const label = req.body.label !== undefined ? str(req.body.label, { required: true, max: 200, name: 'Checklist item' }) : it.label;
     const pos = req.body.position !== undefined ? num(req.body.position, { int: true, min: 0, max: 10000, name: 'position' }) : it.position;
-    db.prepare('UPDATE checklist_items SET label=?, position=? WHERE id=?').run(label, pos, it.id);
+    await db.run('UPDATE checklist_items SET label=?, position=? WHERE id=?', label, pos, it.id);
     res.json({ item: { id: it.id, label, position: pos } });
   }));
   // Soft-delete keeps historical checklist completion intact.
-  app.delete('/api/checklist/items/:id', wrap((req, res) => {
-    const r = db.prepare('UPDATE checklist_items SET active=0 WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
+  app.delete('/api/checklist/items/:id', wrap(async (req, res) => {
+    const r = await db.run('UPDATE checklist_items SET active=0 WHERE id=? AND user_id=?', idOf(req.params.id), req.user.id);
     if (!r.changes) throw notFound('Checklist item not found');
     res.json({ ok: true });
   }));
 
-  app.get('/api/rules', (req, res) => res.json({ rules: db.prepare('SELECT id,rule,category,position FROM trading_rules WHERE user_id=? AND active=1 ORDER BY position,id').all(req.user.id) }));
-  app.post('/api/rules', wrap((req, res) => {
+  app.get('/api/rules', wrap(async (req, res) => res.json({ rules: await db.all('SELECT id,rule,category,position FROM trading_rules WHERE user_id=? AND active=1 ORDER BY position,id', req.user.id) })));
+  app.post('/api/rules', wrap(async (req, res) => {
     const rule = str(req.body.rule, { required: true, max: 300, name: 'Rule' });
     const cat = str(req.body.category, { max: 40, name: 'Category' }) || 'general';
-    const pos = db.prepare('SELECT COALESCE(MAX(position),0)+1 p FROM trading_rules WHERE user_id=?').get(req.user.id).p;
-    const id = db.prepare('INSERT INTO trading_rules(user_id,rule,category,position) VALUES(?,?,?,?)').run(req.user.id, rule, cat, pos).lastInsertRowid;
-    res.status(201).json({ rule: db.prepare('SELECT id,rule,category,position FROM trading_rules WHERE id=?').get(id) });
+    const { p } = await db.get('SELECT COALESCE(MAX(position),0)+1 p FROM trading_rules WHERE user_id=?', req.user.id);
+    res.status(201).json({ rule: await db.get('INSERT INTO trading_rules(user_id,rule,category,position) VALUES(?,?,?,?) RETURNING id,rule,category,position', req.user.id, rule, cat, p) });
   }));
-  app.patch('/api/rules/:id', wrap((req, res) => {
-    const r = db.prepare('SELECT * FROM trading_rules WHERE id=? AND user_id=? AND active=1').get(req.params.id, req.user.id);
+  app.patch('/api/rules/:id', wrap(async (req, res) => {
+    const r = await db.get('SELECT * FROM trading_rules WHERE id=? AND user_id=? AND active=1', idOf(req.params.id), req.user.id);
     if (!r) throw notFound('Rule not found');
     const rule = req.body.rule !== undefined ? str(req.body.rule, { required: true, max: 300, name: 'Rule' }) : r.rule;
     const cat = req.body.category !== undefined ? (str(req.body.category, { max: 40, name: 'Category' }) || 'general') : r.category;
-    db.prepare('UPDATE trading_rules SET rule=?, category=? WHERE id=?').run(rule, cat, r.id);
+    await db.run('UPDATE trading_rules SET rule=?, category=? WHERE id=?', rule, cat, r.id);
     res.json({ rule: { id: r.id, rule, category: cat, position: r.position } });
   }));
-  app.delete('/api/rules/:id', wrap((req, res) => {
-    const r = db.prepare('UPDATE trading_rules SET active=0 WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
+  app.delete('/api/rules/:id', wrap(async (req, res) => {
+    const r = await db.run('UPDATE trading_rules SET active=0 WHERE id=? AND user_id=?', idOf(req.params.id), req.user.id);
     if (!r.changes) throw notFound('Rule not found');
     res.json({ ok: true });
   }));
 
-  const weeklyView = w => w && ({ weekStart: w.week_start, whatWorked: w.what_worked, whatDidnt: w.what_didnt, improvements: w.improvements, focusNextWeek: w.focus_next_week, rating: w.rating, updatedAt: w.updated_at });
-  app.get('/api/weekly/:weekStart', wrap((req, res) => {
-    const ws = ymd(req.params.weekStart, 'week start');
-    if (weekStart(ws) !== ws) throw bad('Week start must be a Monday');
-    res.json({ review: weeklyView(db.prepare('SELECT * FROM weekly_reviews WHERE user_id=? AND week_start=?').get(req.user.id, ws)) || null });
+  const weeklyView = (w) => w && ({ weekStart: w.week_start, whatWorked: w.what_worked, whatDidnt: w.what_didnt, improvements: w.improvements, focusNextWeek: w.focus_next_week, rating: w.rating, updatedAt: w.updated_at });
+  const getWeekly = (userId, ws) => db.get('SELECT * FROM weekly_reviews WHERE user_id=? AND week_start=?', userId, ws);
+  const mondayParam = (v) => { const ws = ymd(v, 'week start'); if (weekStart(ws) !== ws) throw bad('Week start must be a Monday'); return ws; };
+  app.get('/api/weekly/:weekStart', wrap(async (req, res) => {
+    res.json({ review: weeklyView(await getWeekly(req.user.id, mondayParam(req.params.weekStart))) || null });
   }));
-  app.put('/api/weekly/:weekStart', wrap((req, res) => {
-    const ws = ymd(req.params.weekStart, 'week start');
-    if (weekStart(ws) !== ws) throw bad('Week start must be a Monday');
+  app.put('/api/weekly/:weekStart', wrap(async (req, res) => {
+    const ws = mondayParam(req.params.weekStart);
     const b = req.body;
     const vals = [str(b.whatWorked, { max: 4000, name: 'What worked' }), str(b.whatDidnt, { max: 4000, name: "What didn't" }), str(b.improvements, { max: 4000, name: 'Improvements' }),
       str(b.focusNextWeek, { max: 4000, name: 'Focus' }), num(b.rating, { min: 1, max: 5, int: true, name: 'Rating' })];
-    db.prepare(`INSERT INTO weekly_reviews(user_id,week_start,what_worked,what_didnt,improvements,focus_next_week,rating) VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(user_id,week_start) DO UPDATE SET what_worked=excluded.what_worked, what_didnt=excluded.what_didnt, improvements=excluded.improvements,
-                focus_next_week=excluded.focus_next_week, rating=excluded.rating, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`).run(req.user.id, ws, ...vals);
-    res.json({ review: weeklyView(db.prepare('SELECT * FROM weekly_reviews WHERE user_id=? AND week_start=?').get(req.user.id, ws)) });
+    await db.run(`INSERT INTO weekly_reviews(user_id,week_start,what_worked,what_didnt,improvements,focus_next_week,rating) VALUES(?,?,?,?,?,?,?)
+                  ON CONFLICT(user_id,week_start) DO UPDATE SET what_worked=excluded.what_worked, what_didnt=excluded.what_didnt, improvements=excluded.improvements,
+                  focus_next_week=excluded.focus_next_week, rating=excluded.rating, updated_at=${NOW_ISO}`, req.user.id, ws, ...vals);
+    res.json({ review: weeklyView(await getWeekly(req.user.id, ws)) });
   }));
 
   // ---- discipline & reports -----------------------------------------------------
-  app.get('/api/discipline', wrap((req, res) => {
+  app.get('/api/discipline', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
     const today = localDate(now(), req.user.timezone);
     const to = req.query.to ? ymd(req.query.to, 'to') : today;
     const from = req.query.from ? ymd(req.query.from, 'from') : addDays(to, -29);
     if (from > to || addDays(from, 366) < to) throw bad('Invalid range (max 1 year)');
-    res.json({ mode: m, ...disciplineRange(db, req.user, from, to, m) });
+    res.json({ mode: m, ...(await disciplineRange(db, req.user, from, to, m)) });
   }));
 
-  app.get('/api/reports/daily/:date', wrap((req, res) => {
+  app.get('/api/reports/daily/:date', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
     const d = ymd(req.params.date);
     const tz = req.user.timezone;
-    const trades = tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(d, tz).toISOString(), to: startOfLocalDay(addDays(d, 1), tz).toISOString() });
-    const p = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, d);
-    const events = queryEvents(db, { from: startOfLocalDay(d, tz).toISOString(), to: startOfLocalDay(addDays(d, 1), tz).toISOString(), impacts: ['high', 'medium'] }).map(e => presentEvent(e, tz, now()));
+    const trades = await tradesFor(db, req.user.id, { mode: m, ...dayRange(d, tz) });
+    const events = (await queryEvents(db, { ...dayRange(d, tz), impacts: ['high', 'medium'] })).map((e) => presentEvent(e, tz, now()));
     res.json({
       mode: m, date: d, timezone: tz, stats: computeStats(trades, tz), trades: trades.map(tradeView),
-      plan: planView(p) || null, checklist: checklistFor(req.user.id, d), rules: rulesFor(req.user.id, d),
-      discipline: disciplineForDay(db, req.user, d, m), news: events,
+      plan: planView(await getPlan(req.user.id, d)) || null, checklist: await checklistFor(req.user.id, d), rules: await rulesFor(req.user.id, d),
+      discipline: await disciplineForDay(db, req.user, d, m), news: events,
     });
   }));
 
-  app.get('/api/reports/weekly/:weekStart', wrap((req, res) => {
+  app.get('/api/reports/weekly/:weekStart', wrap(async (req, res) => {
     const m = mode(req.query.mode, req.user);
-    const ws = ymd(req.params.weekStart, 'week start');
-    if (weekStart(ws) !== ws) throw bad('Week start must be a Monday');
+    const ws = mondayParam(req.params.weekStart);
     const tz = req.user.timezone;
-    const trades = tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(ws, tz).toISOString(), to: startOfLocalDay(addDays(ws, 7), tz).toISOString() });
-    const prev = tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(addDays(ws, -7), tz).toISOString(), to: startOfLocalDay(ws, tz).toISOString() });
-    const disc = disciplineRange(db, req.user, ws, addDays(ws, 6), m);
-    const days = [];
+    const trades = await tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(ws, tz).toISOString(), to: startOfLocalDay(addDays(ws, 7), tz).toISOString() });
+    const prev = await tradesFor(db, req.user.id, { mode: m, from: startOfLocalDay(addDays(ws, -7), tz).toISOString(), to: startOfLocalDay(ws, tz).toISOString() });
+    const disc = await disciplineRange(db, req.user, ws, addDays(ws, 6), m);
+    const planned = new Set((await db.all('SELECT plan_date FROM daily_plans WHERE user_id=? AND plan_date BETWEEN ? AND ?', req.user.id, ws, addDays(ws, 6))).map((r) => r.plan_date));
     const st = computeStats(trades, tz);
+    const days = [];
     for (let i = 0; i < 7; i++) {
       const d = addDays(ws, i);
-      const bd = st.byDay.find(x => x.date === d);
-      days.push({ date: d, trades: bd?.trades || 0, net: bd?.net || 0, discipline: disc.days[i].score, planned: !!db.prepare('SELECT 1 FROM daily_plans WHERE user_id=? AND plan_date=?').get(req.user.id, d) });
+      const bd = st.byDay.find((x) => x.date === d);
+      days.push({ date: d, trades: bd?.trades || 0, net: bd?.net || 0, discipline: disc.days[i].score, planned: planned.has(d) });
     }
     res.json({
-      mode: m, weekStart: ws, weekEnd: addDays(ws, 6), timezone: tz, stats: st, previousWeek: { netPnl: computeStats(prev, tz).netPnl, trades: prev.filter(t => t.close_time).length },
+      mode: m, weekStart: ws, weekEnd: addDays(ws, 6), timezone: tz, stats: st, previousWeek: { netPnl: computeStats(prev, tz).netPnl, trades: prev.filter((t) => t.close_time).length },
       days, discipline: { average: disc.average, scoredDays: disc.scoredDays },
-      review: weeklyView(db.prepare('SELECT * FROM weekly_reviews WHERE user_id=? AND week_start=?').get(req.user.id, ws)) || null,
+      review: weeklyView(await getWeekly(req.user.id, ws)) || null,
       trades: trades.map(tradeView),
     });
   }));
 
   // ---- economic calendar ---------------------------------------------------------
   const IMPACT_SET = ['high', 'medium', 'low', 'holiday'];
-  app.get('/api/calendar', wrap((req, res) => {
+  app.get('/api/calendar', wrap(async (req, res) => {
     const tz = req.user.timezone || DEFAULT_TZ;
     const n = now();
     const fromD = req.query.from ? ymd(req.query.from, 'from') : localDate(n, tz);
     const toD = req.query.to ? ymd(req.query.to, 'to') : addDays(fromD, 6);
     if (toD < fromD || addDays(fromD, 31) < toD) throw bad('Invalid range (max 31 days)');
     const impacts = req.query.impacts !== undefined ? String(req.query.impacts).split(',').filter(Boolean) : ['high', 'medium'];
-    if (impacts.some(i => !IMPACT_SET.includes(i))) throw bad('Unknown impact level');
-    const currencies = req.query.currencies !== undefined ? String(req.query.currencies).split(',').filter(Boolean).map(s => s.toUpperCase()) : null;
-    if (currencies && currencies.some(c => !/^[A-Z]{3}$/.test(c))) throw bad('Invalid currency code');
+    if (impacts.some((i) => !IMPACT_SET.includes(i))) throw bad('Unknown impact level');
+    const currencies = req.query.currencies !== undefined ? String(req.query.currencies).split(',').filter(Boolean).map((s) => s.toUpperCase()) : null;
+    if (currencies && currencies.some((c) => !/^[A-Z]{3}$/.test(c))) throw bad('Invalid currency code');
     const events = impacts.length && (!currencies || currencies.length)
-      ? queryEvents(db, { from: startOfLocalDay(fromD, tz).toISOString(), to: startOfLocalDay(addDays(toD, 1), tz).toISOString(), impacts, currencies })
+      ? await queryEvents(db, { from: startOfLocalDay(fromD, tz).toISOString(), to: startOfLocalDay(addDays(toD, 1), tz).toISOString(), impacts, currencies })
       : [];
-    res.json({ timezone: tz, from: fromD, to: toD, status: calendarStatus(db, n), events: events.map(e => presentEvent(e, tz, n)) });
+    res.json({ timezone: tz, from: fromD, to: toD, status: await calendarStatus(db, n), events: events.map((e) => presentEvent(e, tz, n)) });
   }));
-  app.get('/api/calendar/status', (req, res) => res.json(calendarStatus(db, now())));
+  app.get('/api/calendar/status', wrap(async (req, res) => res.json(await calendarStatus(db, now()))));
   // Manual refresh, throttled globally so users cannot exhaust the provider's rate limit.
   app.post('/api/calendar/refresh', wrap(async (req, res) => {
-    const last = db.prepare('SELECT started_at FROM calendar_fetches ORDER BY id DESC LIMIT 1').get();
-    const st = calendarStatus(db, now());
+    const last = await db.get('SELECT started_at FROM calendar_fetches ORDER BY id DESC LIMIT 1');
+    const st = await calendarStatus(db, now());
     const tooSoon = last && now().getTime() - Date.parse(last.started_at) < 5 * 60 * 1000;
     const backoff = st.nextSyncAt && Date.parse(st.nextSyncAt) > now().getTime() && !st.lastAttemptOk;
     if (tooSoon || backoff) return res.status(429).json({ error: 'The calendar was refreshed recently. Next automatic update: ' + (st.nextSyncAt || 'soon'), status: st });
     await syncCalendar(db, { fetchImpl, now: now() });
-    res.json({ status: calendarStatus(db, now()) });
+    res.json({ status: await calendarStatus(db, now()) });
   }));
 
   // ---- web push -------------------------------------------------------------------
   app.get('/api/push/vapid-public-key', (_req, res) => res.json({ publicKey: vapid.publicKey }));
-  app.post('/api/push/subscribe', wrap((req, res) => {
+  app.post('/api/push/subscribe', wrap(async (req, res) => {
     const s = req.body.subscription;
     if (!isValidSubscription(s)) throw bad('Invalid push subscription');
     const ua = String(req.get('User-Agent') || '').slice(0, 300);
     // A browser endpoint belongs to whoever is signed in on that browser now.
-    db.prepare(`INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,user_agent) VALUES(?,?,?,?,?)
-                ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth, user_agent=excluded.user_agent,
-                active=1, failure_count=0, last_error=NULL`).run(req.user.id, s.endpoint, s.keys.p256dh, s.keys.auth, ua);
-    db.prepare('INSERT OR IGNORE INTO notification_prefs(user_id) VALUES(?)').run(req.user.id);
-    const row = db.prepare('SELECT id, created_at FROM push_subscriptions WHERE endpoint=?').get(s.endpoint);
+    const row = await db.get(`INSERT INTO push_subscriptions(user_id,endpoint,p256dh,auth,user_agent) VALUES(?,?,?,?,?)
+                              ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth, user_agent=excluded.user_agent,
+                              active=1, failure_count=0, last_error=NULL RETURNING id, created_at`, req.user.id, s.endpoint, s.keys.p256dh, s.keys.auth, ua);
+    await db.run('INSERT INTO notification_prefs(user_id) VALUES(?) ON CONFLICT DO NOTHING', req.user.id);
     res.status(201).json({ subscription: row });
   }));
-  app.post('/api/push/unsubscribe', wrap((req, res) => {
+  app.post('/api/push/unsubscribe', wrap(async (req, res) => {
     const endpoint = str(req.body.endpoint, { required: true, max: 2000, name: 'endpoint' });
-    const r = db.prepare('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?').run(endpoint, req.user.id);
+    const r = await db.run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, req.user.id);
     res.json({ ok: true, removed: r.changes });
   }));
-  app.get('/api/push/subscriptions', (req, res) => {
-    res.json({ subscriptions: db.prepare('SELECT id, user_agent, active, failure_count, last_success_at, last_failure_at, last_error, created_at, substr(endpoint,1,60) endpoint_preview FROM push_subscriptions WHERE user_id=? ORDER BY id DESC').all(req.user.id) });
-  });
-  app.delete('/api/push/subscriptions/:id', wrap((req, res) => {
-    const r = db.prepare('DELETE FROM push_subscriptions WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
+  app.get('/api/push/subscriptions', wrap(async (req, res) => {
+    res.json({ subscriptions: await db.all('SELECT id, user_agent, active, failure_count, last_success_at, last_failure_at, last_error, created_at, substr(endpoint,1,60) endpoint_preview FROM push_subscriptions WHERE user_id=? ORDER BY id DESC', req.user.id) });
+  }));
+  app.delete('/api/push/subscriptions/:id', wrap(async (req, res) => {
+    const r = await db.run('DELETE FROM push_subscriptions WHERE id=? AND user_id=?', idOf(req.params.id), req.user.id);
     if (!r.changes) throw notFound('Subscription not found');
     res.json({ ok: true });
   }));
 
-  const prefsView = p => ({
+  const prefsView = (p) => ({
     enabled: !!p.enabled, impacts: { high: !!p.impact_high, medium: !!p.impact_medium, low: !!p.impact_low },
     alerts: { t30: !!p.alert_30, t15: !!p.alert_15, release: !!p.alert_release }, dailyBriefing: !!p.daily_briefing,
     briefingTime: p.briefing_time, currencies: prefCurrencies(p), availableCurrencies: SUPPORTED_CURRENCIES,
   });
-  app.get('/api/notifications/prefs', (req, res) => res.json({ prefs: prefsView(getPrefs(db, req.user.id)) }));
-  app.put('/api/notifications/prefs', wrap((req, res) => {
-    const cur = getPrefs(db, req.user.id);
+  app.get('/api/notifications/prefs', wrap(async (req, res) => res.json({ prefs: prefsView(await getPrefs(db, req.user.id)) })));
+  app.put('/api/notifications/prefs', wrap(async (req, res) => {
+    const cur = await getPrefs(db, req.user.id);
     const b = req.body;
     const flag = (v, c) => (v === undefined ? c : bool01(v, 'preference'));
     const p = {
@@ -704,32 +726,30 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
       daily_briefing: flag(b.dailyBriefing, cur.daily_briefing),
       briefing_time: b.briefingTime !== undefined ? (/^([01]\d|2[0-3]):[0-5]\d$/.test(b.briefingTime) ? b.briefingTime : (() => { throw bad('Briefing time must be HH:MM'); })()) : cur.briefing_time,
       currencies: b.currencies !== undefined ? (() => {
-        if (!Array.isArray(b.currencies) || b.currencies.some(c => !SUPPORTED_CURRENCIES.includes(c))) throw bad('Unsupported currency');
+        if (!Array.isArray(b.currencies) || b.currencies.some((c) => !SUPPORTED_CURRENCIES.includes(c))) throw bad('Unsupported currency');
         return [...new Set(b.currencies)].join(',');
       })() : cur.currencies,
     };
-    db.prepare(`INSERT INTO notification_prefs(user_id,enabled,impact_high,impact_medium,impact_low,alert_30,alert_15,alert_release,daily_briefing,briefing_time,currencies)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, impact_high=excluded.impact_high, impact_medium=excluded.impact_medium,
-                impact_low=excluded.impact_low, alert_30=excluded.alert_30, alert_15=excluded.alert_15, alert_release=excluded.alert_release, daily_briefing=excluded.daily_briefing,
-                briefing_time=excluded.briefing_time, currencies=excluded.currencies`)
-      .run(req.user.id, p.enabled, p.impact_high, p.impact_medium, p.impact_low, p.alert_30, p.alert_15, p.alert_release, p.daily_briefing, p.briefing_time, p.currencies);
-    res.json({ prefs: prefsView(getPrefs(db, req.user.id)) });
+    await db.run(`INSERT INTO notification_prefs(user_id,enabled,impact_high,impact_medium,impact_low,alert_30,alert_15,alert_release,daily_briefing,briefing_time,currencies)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, impact_high=excluded.impact_high, impact_medium=excluded.impact_medium,
+                  impact_low=excluded.impact_low, alert_30=excluded.alert_30, alert_15=excluded.alert_15, alert_release=excluded.alert_release, daily_briefing=excluded.daily_briefing,
+                  briefing_time=excluded.briefing_time, currencies=excluded.currencies`,
+    req.user.id, p.enabled, p.impact_high, p.impact_medium, p.impact_low, p.alert_30, p.alert_15, p.alert_release, p.daily_briefing, p.briefing_time, p.currencies);
+    res.json({ prefs: prefsView(await getPrefs(db, req.user.id)) });
   }));
-  app.get('/api/notifications/history', (req, res) => {
-    res.json({ notifications: db.prepare(`SELECT n.id, n.kind, n.title, n.body, n.due_at, n.status, n.attempts, n.last_error, n.sent_at, n.created_at
-      FROM notifications n WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100`).all(req.user.id) });
-  });
+  app.get('/api/notifications/history', wrap(async (req, res) => {
+    res.json({ notifications: await db.all(`SELECT n.id, n.kind, n.title, n.body, n.due_at, n.status, n.attempts, n.last_error, n.sent_at, n.created_at
+      FROM notifications n WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100`, req.user.id) });
+  }));
   app.post('/api/notifications/test', wrap(async (req, res) => {
-    const subs = db.prepare('SELECT COUNT(*) c FROM push_subscriptions WHERE user_id=? AND active=1').get(req.user.id).c;
+    const subs = await count('SELECT COUNT(*)::int c FROM push_subscriptions WHERE user_id=? AND active=1', req.user.id);
     if (!subs) throw bad('No active device subscription. Enable notifications on this device first.');
-    const r = await sendTestNotification(db, req.user.id, sender, now());
-    res.json(r);
+    res.json(await sendTestNotification(db, req.user.id, sender, now()));
   }));
 
-  app.get('/api/health', (_req, res) => res.json({ ok: true }));
   app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 
-  // ---- static client (built SPA) --------------------------------------------------
+  // ---- static client (built SPA) — only when not served by a CDN (Vercel) ----------
   if (publicDir && fs.existsSync(publicDir)) {
     app.get('/sw.js', (_req, res) => { res.set({ 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' }); res.sendFile(path.join(publicDir, 'sw.js')); });
     app.use(express.static(publicDir, { index: false, maxAge: '1h', setHeaders: (res, p) => { if (p.includes(`${path.sep}assets${path.sep}`)) res.set('Cache-Control', 'public, max-age=31536000, immutable'); } }));
@@ -740,6 +760,7 @@ export function createApp(db, { dataDir, publicDir, vapid, sender, fetchImpl, se
   app.use((err, _req, res, _next) => {
     if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Upload is too large' });
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON body' });
+    if (err.code === '22P02' || err.code === '22003') return res.status(400).json({ error: 'Invalid value' });
     const status = err.status || 500;
     if (status >= 500) console.error(err);
     res.status(status).json({ error: status >= 500 ? 'Internal server error' : err.message });

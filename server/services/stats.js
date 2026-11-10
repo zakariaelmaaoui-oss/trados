@@ -12,9 +12,9 @@ export function tradesFor(db, userId, { mode, accountId, from, to, closedOnly = 
   if (from) { where.push('COALESCE(t.close_time, t.open_time) >= ?'); args.push(from); }
   if (to) { where.push('COALESCE(t.close_time, t.open_time) < ?'); args.push(to); }
   if (closedOnly) where.push('t.close_time IS NOT NULL');
-  return db.prepare(`SELECT t.*, a.name AS account_name, a.type AS account_type, a.currency AS account_currency
-                     FROM trades t JOIN accounts a ON a.id = t.account_id AND a.user_id = t.user_id
-                     WHERE ${where.join(' AND ')} ORDER BY COALESCE(t.close_time, t.open_time)`).all(...args);
+  return db.all(`SELECT t.*, a.name AS account_name, a.type AS account_type, a.currency AS account_currency
+                 FROM trades t JOIN accounts a ON a.id = t.account_id AND a.user_id = t.user_id
+                 WHERE ${where.join(' AND ')} ORDER BY COALESCE(t.close_time, t.open_time), t.id`, ...args);
 }
 
 const round = (n, d = 2) => (n === null || !Number.isFinite(n) ? null : Math.round(n * 10 ** d) / 10 ** d);
@@ -76,17 +76,17 @@ export function computeStats(trades, tz) {
  * checklist completion, rule adherence, max-trades limit, max-loss limit,
  * plan-followed flags on trades, and whether the post-session review was done.
  */
-export function disciplineForDay(db, user, ymd, mode) {
+export async function disciplineForDay(db, user, ymd, mode) {
   const tz = user.timezone;
   const from = startOfLocalDay(ymd, tz).toISOString();
   const to = startOfLocalDay(addDays(ymd, 1), tz).toISOString();
-  const plan = db.prepare('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?').get(user.id, ymd);
-  const items = db.prepare('SELECT COUNT(*) c FROM checklist_items WHERE user_id=? AND active=1').get(user.id).c;
-  const checked = db.prepare(`SELECT COUNT(*) c FROM checklist_checks cc JOIN checklist_items ci ON ci.id=cc.item_id
-                              WHERE cc.user_id=? AND cc.check_date=? AND cc.checked=1 AND ci.active=1`).get(user.id, ymd).c;
-  const adh = db.prepare('SELECT followed FROM rule_adherence ra JOIN trading_rules r ON r.id=ra.rule_id WHERE ra.user_id=? AND ra.review_date=? AND r.active=1').all(user.id, ymd);
-  const dayTrades = db.prepare(`SELECT t.* FROM trades t JOIN accounts a ON a.id=t.account_id
-                                WHERE t.user_id=? AND a.type=? AND t.open_time >= ? AND t.open_time < ?`).all(user.id, mode, from, to);
+  const plan = await db.get('SELECT * FROM daily_plans WHERE user_id=? AND plan_date=?', user.id, ymd);
+  const items = (await db.get('SELECT COUNT(*)::int c FROM checklist_items WHERE user_id=? AND active=1', user.id)).c;
+  const checked = (await db.get(`SELECT COUNT(*)::int c FROM checklist_checks cc JOIN checklist_items ci ON ci.id=cc.item_id
+                                 WHERE cc.user_id=? AND cc.check_date=? AND cc.checked=1 AND ci.active=1`, user.id, ymd)).c;
+  const adh = await db.all('SELECT followed FROM rule_adherence ra JOIN trading_rules r ON r.id=ra.rule_id WHERE ra.user_id=? AND ra.review_date=? AND r.active=1', user.id, ymd);
+  const dayTrades = await db.all(`SELECT t.* FROM trades t JOIN accounts a ON a.id=t.account_id
+                                  WHERE t.user_id=? AND a.type=? AND t.open_time >= ? AND t.open_time < ?`, user.id, mode, from, to);
   const components = [];
   if (plan || dayTrades.length) {
     if (items) components.push({ key: 'checklist', label: 'Pre-trading checklist', score: checked / items, detail: `${checked}/${items} checked` });
@@ -98,7 +98,7 @@ export function disciplineForDay(db, user, ymd, mode) {
       components.push({ key: 'max_trades', label: 'Max trades respected', score: dayTrades.length <= plan.max_trades ? 1 : 0, detail: `${dayTrades.length}/${plan.max_trades} trades` });
     }
     if (plan?.max_daily_loss_pct) {
-      const bal = db.prepare('SELECT COALESCE(SUM(starting_balance),0) b FROM accounts WHERE user_id=? AND type=?').get(user.id, mode).b;
+      const bal = (await db.get('SELECT COALESCE(SUM(starting_balance),0)::float8 b FROM accounts WHERE user_id=? AND type=?', user.id, mode)).b;
       const dayNet = dayTrades.filter(t => t.close_time).reduce((a, t) => a + net(t), 0);
       if (bal > 0) {
         const lossPct = dayNet < 0 ? (-dayNet / bal) * 100 : 0;
@@ -117,9 +117,10 @@ export function disciplineForDay(db, user, ymd, mode) {
   return { date: ymd, score, components, trades: dayTrades.length };
 }
 
-export function disciplineRange(db, user, fromYmd, toYmd, mode) {
-  const days = [];
-  for (let d = fromYmd; d <= toYmd; d = addDays(d, 1)) days.push(disciplineForDay(db, user, d, mode));
+export async function disciplineRange(db, user, fromYmd, toYmd, mode) {
+  const dates = [];
+  for (let d = fromYmd; d <= toYmd; d = addDays(d, 1)) dates.push(d);
+  const days = await Promise.all(dates.map((d) => disciplineForDay(db, user, d, mode)));
   const scored = days.filter(d => d.score !== null);
   // Streak: consecutive most-recent scored days with score >= 80
   let streak = 0;

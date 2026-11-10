@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { openDb, kvGet } from '../server/db.js';
 import { syncCalendar, calendarStatus, queryEvents, releaseStatus } from '../server/services/calendar.js';
 import { normalise } from '../server/services/providers/forexfactory.js';
-import { recordedProviderFetch, startApp, registerUser } from './helpers.js';
+import { recordedProviderFetch, startApp, registerUser, testDb } from './helpers.js';
 
 test('normalise de-duplicates identical provider rows and drops malformed rows instead of guessing', () => {
   const row = { title: 'CPI m/m', country: 'USD', date: '2026-11-10T08:30:00-05:00', impact: 'High', forecast: '0.3%', previous: '0.6%' };
@@ -13,44 +13,44 @@ test('normalise de-duplicates identical provider rows and drops malformed rows i
 });
 
 test('sync stores the recorded real provider data once; re-sync creates no duplicates', async () => {
-  const db = openDb(':memory:');
+  const db = await testDb();
   const f1 = await syncCalendar(db, { fetchImpl: recordedProviderFetch(), now: new Date('2026-11-10T16:00:00Z') });
   assert.equal(f1.ok, 1);
   assert.equal(f1.events_received, 105);
   assert.equal(f1.events_new, 105);
   const f2 = await syncCalendar(db, { fetchImpl: recordedProviderFetch(), now: new Date('2026-11-10T17:00:00Z') });
   assert.equal(f2.events_new, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) c FROM econ_events').get().c, 105);
+  assert.equal((await db.get('SELECT COUNT(*)::int c FROM econ_events')).c, 105);
 });
 
 test('rescheduled/removed events are deactivated, not duplicated', async () => {
-  const db = openDb(':memory:');
+  const db = await testDb();
   await syncCalendar(db, { fetchImpl: recordedProviderFetch(), now: new Date('2026-11-10T16:00:00Z') });
   // Provider moves UK GDP by 30 minutes.
   await syncCalendar(db, {
     now: new Date('2026-11-10T17:00:00Z'),
     fetchImpl: recordedProviderFetch((d) => d.map((e) => (e.title === 'GDP m/m' && e.country === 'GBP' ? { ...e, date: '2026-11-12T02:30:00-05:00' } : e))),
   });
-  const gdp = db.prepare("SELECT scheduled_at, active FROM econ_events WHERE title='GDP m/m' AND currency='GBP' ORDER BY scheduled_at").all();
+  const gdp = await db.all("SELECT scheduled_at, active FROM econ_events WHERE title='GDP m/m' AND currency='GBP' ORDER BY scheduled_at");
   assert.deepEqual(gdp.map((r) => ({ ...r })), [{ scheduled_at: '2026-11-12T07:00:00.000Z', active: 0 }, { scheduled_at: '2026-11-12T07:30:00.000Z', active: 1 }]);
-  const visible = queryEvents(db, { from: '2026-11-12T00:00:00Z', to: '2026-11-13T00:00:00Z', impacts: ['high'] }).filter((e) => e.title === 'GDP m/m');
+  const visible = (await queryEvents(db, { from: '2026-11-12T00:00:00Z', to: '2026-11-13T00:00:00Z', impacts: ['high'] })).filter((e) => e.title === 'GDP m/m');
   assert.equal(visible.length, 1);
 });
 
 test('HTTP 429 from provider: error recorded, Retry-After honoured, old data kept and flagged stale later', async () => {
-  const db = openDb(':memory:');
+  const db = await testDb();
   await syncCalendar(db, { fetchImpl: recordedProviderFetch(), now: new Date('2026-11-10T08:00:00Z') });
   const t = new Date('2026-11-10T09:00:00Z');
   const fail = await syncCalendar(db, { now: t, fetchImpl: async () => new Response('slow down', { status: 429, headers: { 'retry-after': '900' } }) });
   assert.equal(fail.ok, 0);
   assert.equal(fail.http_status, 429);
-  assert.equal(kvGet(db, 'calendar.next_sync_at'), new Date(t.getTime() + 900e3).toISOString());
-  assert.equal(db.prepare('SELECT COUNT(*) c FROM econ_events WHERE active=1').get().c, 105, 'existing data untouched');
-  const fresh = calendarStatus(db, new Date(t.getTime() + 60e3));
+  assert.equal(await kvGet(db, 'calendar.next_sync_at'), new Date(t.getTime() + 900e3).toISOString());
+  assert.equal((await db.get('SELECT COUNT(*)::int c FROM econ_events WHERE active=1')).c, 105, 'existing data untouched');
+  const fresh = await calendarStatus(db, new Date(t.getTime() + 60e3));
   assert.equal(fresh.stale, false);
   assert.equal(fresh.lastAttemptOk, false);
   assert.match(fresh.lastError, /429/);
-  const later = calendarStatus(db, new Date(Date.parse('2026-11-10T08:00:00Z') + 7 * 3600e3));
+  const later = await calendarStatus(db, new Date(Date.parse('2026-11-10T08:00:00Z') + 7 * 3600e3));
   assert.equal(later.stale, true);
   // network failure + invalid JSON also handled
   const net = await syncCalendar(db, { now: t, fetchImpl: async () => { throw new TypeError('fetch failed'); } });

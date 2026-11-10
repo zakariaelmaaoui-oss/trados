@@ -5,6 +5,7 @@ import { useAuth, PageHead } from '../App.jsx';
 import { Card, Alert, Loading, Field, useToast } from '../components/ui.jsx';
 import { Icon } from '../components/icons.jsx';
 import { isoToLocalInput, localInputToIso, money, signClass } from '../format.js';
+import { prepareImage } from '../image.js';
 
 const EMOTIONS = ['Calm', 'Confident', 'Focused', 'Anxious', 'Fearful', 'Greedy', 'Impatient', 'Revenge', 'FOMO', 'Bored'];
 
@@ -171,8 +172,9 @@ function Screenshots({ kind, trade, onChange, onOpen }) {
   const upload = async (files) => {
     setBusy(true);
     try {
-      for (const file of files) {
-        if (file.size > 5 * 1024 * 1024) { toast(`${file.name} is larger than 5 MB`, 'error'); continue; }
+      for (const original of files) {
+        const file = await prepareImage(original);
+        if (file.size > 4 * 1024 * 1024) { toast(`${original.name} is too large (max 4 MB)`, 'error'); continue; }
         await api.upload(`/api/trades/${trade.id}/screenshots?kind=${kind}`, file);
       }
       const r = await api.get(`/api/trades/${trade.id}`);
@@ -198,7 +200,7 @@ function Screenshots({ kind, trade, onChange, onOpen }) {
         <div className={`dropzone ${over ? 'over' : ''}`} onClick={() => input.current.click()} onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
           onDrop={(e) => { e.preventDefault(); setOver(false); upload([...e.dataTransfer.files]); }} role="button" tabIndex={0} onKeyDown={(e) => e.key === 'Enter' && input.current.click()}>
           <div className="small text-2">{busy ? 'Uploading…' : 'Drop an image here or click to choose'}</div>
-          <div className="tiny muted">PNG, JPEG, WebP or GIF · max 5 MB</div>
+          <div className="tiny muted">PNG, JPEG, WebP or GIF · large images are resized automatically</div>
           <input ref={input} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden onChange={(e) => { upload([...e.target.files]); e.target.value = ''; }} />
         </div>
       </div>
