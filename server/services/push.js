@@ -20,7 +20,12 @@ export async function loadVapid(db, env = process.env) {
       await kvSet(db, 'vapid.private', privateKey);
     }
   }
-  const subject = env.VAPID_SUBJECT || 'mailto:admin@tradeos.invalid';
+  // Apple's push service rejects placeholder subjects (403 BadJwtToken): use the
+  // site's real https origin unless a valid mailto:/https: subject is configured.
+  const host = env.VERCEL_PROJECT_PRODUCTION_URL || env.VERCEL_URL;
+  const subject = (env.VAPID_SUBJECT && /^(mailto:[^@\s]+@[^@\s]+\.[a-z]{2,}|https:\/\/)/i.test(env.VAPID_SUBJECT) && !/\.invalid$|localhost/i.test(env.VAPID_SUBJECT))
+    ? env.VAPID_SUBJECT
+    : host ? `https://${host}` : 'https://github.com/zakariaelmaaoui-oss/trados';
   return { publicKey, privateKey, subject };
 }
 

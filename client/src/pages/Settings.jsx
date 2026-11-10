@@ -45,6 +45,13 @@ function Profile() {
   );
 }
 
+function deviceName(ua = '') {
+  if (!ua) return 'Unknown browser';
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac OS X/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : 'Device';
+  const br = /Edg\//.test(ua) ? 'Edge' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  return `${os} · ${br}`;
+}
+
 const OFFSETS = Array.from({ length: 27 }, (_, i) => (i - 12) * 60);
 const fmtOffset = (m) => `UTC${m >= 0 ? '+' : '−'}${String(Math.floor(Math.abs(m) / 60)).padStart(2, '0')}:00`;
 
@@ -166,7 +173,7 @@ function Notifications() {
             ))}
             <div className="toggle-row">
               <span>Daily upcoming-news briefing</span>
-              <div className="row"><input className="input" type="time" value={p.briefingTime} onChange={(e) => e.target.value && update({ briefingTime: e.target.value })} style={{ width: 120, height: 34 }} aria-label="Briefing time" disabled={!p.dailyBriefing} /><Switch checked={p.dailyBriefing} onChange={(v) => update({ dailyBriefing: v })} label="Daily briefing" /></div>
+              <div className="row"><input className="input" type="time" value={p.briefingTime} onChange={(e) => e.target.value && update({ briefingTime: e.target.value })} style={{ width: 132, height: 34 }} aria-label="Briefing time" disabled={!p.dailyBriefing} /><Switch checked={p.dailyBriefing} onChange={(v) => update({ dailyBriefing: v })} label="Daily briefing" /></div>
             </div>
             <h3 style={{ margin: '14px 0 8px' }}>Currencies</h3>
             <div className="chips">
@@ -183,8 +190,8 @@ function Notifications() {
           {(devices.data?.subscriptions || []).length === 0 ? <p className="small muted">No devices subscribed.</p> : (
             <div className="list">{devices.data.subscriptions.map((d) => (
               <div className="list-item" key={d.id}>
-                <div className="grow"><div className="small ellipsis">{d.user_agent || 'Unknown browser'}</div>
-                  <div className="tiny muted">{d.active ? 'Active' : 'Inactive'} · last delivery {d.last_success_at ? fmtDateTime(d.last_success_at) : 'never'}{d.last_error ? ` · ${d.last_error}` : ''}</div></div>
+                <div className="grow" style={{ minWidth: 0 }}><div className="small ellipsis" title={d.user_agent || ''}>{deviceName(d.user_agent)}</div>
+                  <div className="tiny muted" style={{ overflowWrap: 'anywhere' }}>{d.active ? 'Active' : 'Inactive'} · last delivery {d.last_success_at ? fmtDateTime(d.last_success_at) : 'never'}{d.last_error ? ` · ${d.last_error}` : ''}</div></div>
                 <button className="btn sm ghost danger" onClick={() => removeDevice(d.id)} aria-label="Remove device"><Icon.trash /></button>
               </div>))}
             </div>

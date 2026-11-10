@@ -275,14 +275,27 @@ const step = async (name, fn) => {
     const m = await browser.newContext({ ...require('playwright').devices['iPhone 13'], storageState: await ctx.storageState() });
     const mp = await m.newPage();
     await mp.goto(BASE + '/');
+    // A subscribed iPhone (long user-agent) must not widen the Settings page.
+    const ec = require('node:crypto').createECDH('prime256v1'); ec.generateKeys();
+    const sub = { endpoint: 'https://web.push.apple.com/QE2e-test-' + Date.now(), keys: { p256dh: ec.getPublicKey().toString('base64url'), auth: require('node:crypto').randomBytes(16).toString('base64url') } };
+    const st = await mp.evaluate((s) => fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TradeOS-Request': '1' }, body: JSON.stringify({ subscription: s }) }).then((r) => r.status), sub);
+    assert.equal(st, 201);
     await mp.locator('.mobile-nav').waitFor();
     assert.equal(await mp.locator('.sidebar').isVisible(), false);
     const overflow = await mp.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
     assert.equal(overflow, false, 'no horizontal scroll');
     await mp.screenshot({ path: path.join(SHOTS, 'mobile-dashboard.png') });
+    for (const pth of ['/calendar', '/journal', '/journal/new', '/import', '/planner', '/discipline', '/reports', '/settings', '/weekly']) {
+      await mp.goto(BASE + pth);
+      await mp.waitForLoadState('networkidle');
+      const w = await mp.evaluate(() => [document.documentElement.scrollWidth, window.innerWidth]);
+      assert.ok(w[0] <= w[1] + 1, `${pth} overflows horizontally: ${w[0]}px > ${w[1]}px`);
+    }
+    await mp.goto(BASE + '/settings');
+    await mp.getByText('iPhone · Safari').waitFor();
+    await mp.screenshot({ path: path.join(SHOTS, 'mobile-settings.png'), fullPage: true });
     await mp.goto(BASE + '/calendar');
     await mp.waitForLoadState('networkidle');
-    assert.equal(await mp.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1), false);
     await mp.screenshot({ path: path.join(SHOTS, 'mobile-calendar.png') });
     await m.close();
   });

@@ -210,3 +210,15 @@ test('cron endpoint (used by cron-job.org on Vercel) requires the secret and run
     assert.equal(u.got().length, 0, 'real clock: no alerts due for these recorded events');
   } finally { await app.close(); }
 });
+
+test('VAPID subject is a real https origin or valid mailto (Apple rejects placeholders with BadJwtToken)', async () => {
+  const { loadVapid } = await import('../server/services/push.js');
+  const { testDb } = await import('./helpers.js');
+  const db = await testDb();
+  try {
+    assert.equal((await loadVapid(db, { VERCEL_PROJECT_PRODUCTION_URL: 'trados-eight.vercel.app' })).subject, 'https://trados-eight.vercel.app');
+    assert.equal((await loadVapid(db, { VAPID_SUBJECT: 'mailto:me@example.com' })).subject, 'mailto:me@example.com');
+    assert.match((await loadVapid(db, { VAPID_SUBJECT: 'mailto:admin@tradeos.invalid' })).subject, /^https:\/\//);
+    assert.match((await loadVapid(db, {})).subject, /^https:\/\//);
+  } finally { await db.close(); }
+});
