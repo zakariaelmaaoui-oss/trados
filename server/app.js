@@ -97,8 +97,11 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
   // external cron (cron-job.org) on Vercel; protected by a shared secret.
   app.all('/api/cron/tick', wrap(async (req, res) => {
     const auth = req.get('Authorization') || '';
-    const given = auth.startsWith('Bearer ') ? auth.slice(7) : req.query.key;
-    if (!cronSecret || given !== cronSecret) return res.status(401).json({ error: 'Unauthorized' });
+    const given = String((auth.startsWith('Bearer ') ? auth.slice(7) : req.query.key) || '').trim();
+    const secret = String(cronSecret || '').trim();
+    if (!secret) return res.status(401).json({ error: 'Unauthorized', reason: 'CRON_SECRET is not set on the server (add it in Vercel → Environment Variables, then redeploy)' });
+    if (!given) return res.status(401).json({ error: 'Unauthorized', reason: 'No key given (add ?key=YOUR_SECRET to the URL)' });
+    if (given !== secret) return res.status(401).json({ error: 'Unauthorized', reason: 'Key does not match CRON_SECRET' });
     res.json(await runScheduledJobs(db, { send: sender, fetchImpl, now: now() }));
   }));
 
