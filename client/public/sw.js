@@ -1,5 +1,5 @@
 /* TradeOS service worker: app-shell caching + Web Push. Never caches /api (private data). */
-const CACHE = 'tradeos-shell-v1';
+const CACHE = 'tradeos-shell-v2';
 const SHELL = ['/', '/manifest.webmanifest', '/icons/icon.svg', '/icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
