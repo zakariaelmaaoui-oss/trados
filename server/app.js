@@ -13,6 +13,7 @@ import { calendarStatus, presentEvent, queryEvents, syncCalendar } from './servi
 import { getPrefs, SUPPORTED_CURRENCIES, sendTestNotification, prefImpacts, prefCurrencies } from './services/notifications.js';
 import { isValidSubscription } from './services/push.js';
 import { runScheduledJobs } from './scheduler.js';
+import { findToken, validatePayload, newSyncToken } from './services/mt5sync.js';
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const bad = (msg) => new HttpError(400, msg);
@@ -103,6 +104,58 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     if (!given) return res.status(401).json({ error: 'Unauthorized', reason: 'No key given (add ?key=YOUR_SECRET to the URL)' });
     if (given !== secret) return res.status(401).json({ error: 'Unauthorized', reason: 'Key does not match CRON_SECRET' });
     res.json(await runScheduledJobs(db, { send: sender, fetchImpl, now: now() }));
+  }));
+
+  // ---- MT5 auto-sync (called by the TradeOS Expert Advisor, key auth, no cookies) ----
+  const eaLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
+  const eaAuth = wrap(async (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    const tok = await findToken(db, req.get('Authorization'));
+    if (!tok) return res.status(401).json({ error: 'Invalid or revoked sync key. Create a new key in TradeOS → Settings → Trading accounts → MT5 auto-sync.' });
+    req.syncToken = tok;
+    next();
+  });
+  app.get('/api/mt5/ping', eaLimiter, eaAuth, (req, res) => {
+    res.json({ ok: true, account: req.syncToken.account_name, type: req.syncToken.account_type });
+  });
+  app.post('/api/mt5/positions', eaLimiter, express.json({ limit: '1mb' }), eaAuth, wrap(async (req, res) => {
+    const tok = req.syncToken;
+    const v = validatePayload(req.body, { now: now().getTime() });
+    if (v.error) throw bad(v.error);
+    // Demo/Live protection: the terminal's account type must match the TradeOS account.
+    if (v.tradeMode) {
+      const termType = v.tradeMode === 'real' ? 'live' : 'demo';
+      if (termType !== tok.account_type) {
+        return res.status(409).json({ error: `This MT5 terminal is a ${termType.toUpperCase()} account but the key belongs to the ${tok.account_type.toUpperCase()} account "${tok.account_name}". Use a key from a ${termType} account.` });
+      }
+    }
+    // One MT5 login per key: refuse a different login so two terminals can't mix into one account.
+    if (tok.mt5_login && v.login && tok.mt5_login !== v.login) {
+      return res.status(409).json({ error: `This key is already linked to MT5 account ${tok.mt5_login}. Create a separate key for MT5 account ${v.login}.` });
+    }
+    const user = await db.get('SELECT default_risk_pct FROM users WHERE id=?', tok.user_id);
+    const acc = { id: tok.account_id, starting_balance: tok.starting_balance };
+    const tickets = v.valid.map((p) => p.ticket);
+    const existing = new Set(tickets.length
+      ? (await db.all(`SELECT ticket FROM trades WHERE account_id=? AND ticket IN (${tickets.map(() => '?').join(',')})`, tok.account_id, ...tickets)).map((r) => r.ticket)
+      : []);
+    const fresh = v.valid.filter((p) => !existing.has(p.ticket)).sort((a, b) => a.open_time.localeCompare(b.open_time));
+    let imported = 0;
+    const importedTickets = [];
+    if (fresh.length) {
+      await db.tx(async (t) => {
+        for (const x of fresh) {
+          const risk = await riskAmountFor(t, acc, user.default_risk_pct, x.open_time);
+          const r = await t.run(`INSERT INTO trades(user_id,account_id,ticket,source,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount)
+                                 VALUES(?,?,?,'mt5_sync',?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (account_id, ticket) DO NOTHING`,
+          tok.user_id, tok.account_id, x.ticket, x.symbol, x.direction, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, user.default_risk_pct, risk);
+          if (r.changes) { imported++; importedTickets.push(x.ticket); }
+        }
+      });
+    }
+    await db.run('UPDATE sync_tokens SET last_used_at=?, last_received=?, last_imported=?, mt5_login=COALESCE(mt5_login, ?), mt5_server=COALESCE(?, mt5_server) WHERE id=?',
+      now().toISOString(), req.body.positions.length, imported, v.login, v.server, tok.id);
+    res.json({ ok: true, account: tok.account_name, type: tok.account_type, received: req.body.positions.length, imported, duplicates: v.valid.length - fresh.length, invalid: v.invalid, importedTickets });
   }));
 
   app.use('/api', express.json({ limit: '200kb' }));
@@ -220,6 +273,28 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     res.json({ ok: true });
   }));
 
+  // ---- MT5 auto-sync keys (managed from Settings) ---------------------------------
+  const tokenView = (t) => ({ id: t.id, hint: t.token_hint, createdAt: t.created_at, lastUsedAt: t.last_used_at, lastReceived: t.last_received, lastImported: t.last_imported, mt5Login: t.mt5_login, mt5Server: t.mt5_server });
+  app.get('/api/accounts/:id/sync-keys', wrap(async (req, res) => {
+    const acc = await ownAccount(req.user.id, req.params.id);
+    if (!acc) throw notFound('Account not found');
+    res.json({ keys: (await db.all('SELECT * FROM sync_tokens WHERE account_id=? AND user_id=? AND revoked=0 ORDER BY id DESC', acc.id, req.user.id)).map(tokenView) });
+  }));
+  app.post('/api/accounts/:id/sync-keys', wrap(async (req, res) => {
+    const acc = await ownAccount(req.user.id, req.params.id);
+    if (!acc) throw notFound('Account not found');
+    if ((await count('SELECT COUNT(*)::int c FROM sync_tokens WHERE account_id=? AND revoked=0', acc.id)) >= 5) throw bad('Maximum 5 active keys per account. Revoke an old key first.');
+    const { token, hash, hint } = newSyncToken();
+    const row = await db.get('INSERT INTO sync_tokens(user_id,account_id,token_hash,token_hint) VALUES(?,?,?,?) RETURNING *', req.user.id, acc.id, hash, hint);
+    // The full key is only ever shown once; only its hash is stored.
+    res.status(201).json({ key: token, info: tokenView(row), account: accountView(acc) });
+  }));
+  app.delete('/api/sync-keys/:id', wrap(async (req, res) => {
+    const r = await db.run('UPDATE sync_tokens SET revoked=1 WHERE id=? AND user_id=? AND revoked=0', idOf(req.params.id), req.user.id);
+    if (!r.changes) throw notFound('Key not found');
+    res.json({ ok: true });
+  }));
+
   // ---- trades -----------------------------------------------------------------
   const shotsFor = (tradeId) => db.all('SELECT id, kind, mime, size, created_at FROM trade_screenshots WHERE trade_id=? ORDER BY id', tradeId);
   const tradeView = (t) => ({
@@ -325,7 +400,7 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     else if (req.body.riskPct !== undefined || req.body.openTime !== undefined) risk = await riskAmountFor(db, acc, t.risk_pct, t.open_time, cur.id);
     // Editing any market data of an imported trade marks it as a manual correction.
     const marketFields = ['symbol', 'direction', 'volume', 'openTime', 'closeTime', 'openPrice', 'closePrice', 'stopLoss', 'takeProfit', 'commission', 'swap', 'profit'];
-    const corrected = cur.corrected || (cur.source === 'mt5_csv' && marketFields.some((f) => req.body[f] !== undefined)) ? 1 : 0;
+    const corrected = cur.corrected || (cur.source !== 'manual' && marketFields.some((f) => req.body[f] !== undefined)) ? 1 : 0;
     try {
       await db.run(`UPDATE trades SET account_id=?, ticket=?, symbol=?, direction=?, volume=?, open_time=?, close_time=?, open_price=?, close_price=?, stop_loss=?, take_profit=?, commission=?, swap=?, profit=?, risk_pct=?, risk_amount=?, setup=?, plan_followed=?, emotion=?, notes=?, corrected=?, updated_at=${NOW_ISO} WHERE id=? AND user_id=?`,
         accountId, t.ticket, t.symbol, t.direction, t.volume, t.open_time, t.close_time, t.open_price, t.close_price, t.stop_loss, t.take_profit, t.commission, t.swap, t.profit, t.risk_pct, risk, t.setup, t.plan_followed, t.emotion, t.notes, corrected, cur.id, req.user.id);

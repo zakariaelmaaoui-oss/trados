@@ -86,12 +86,12 @@ export default function TradeEditor() {
 
   return (
     <>
-      <PageHead title={isNew ? 'New trade' : `${trade.symbol} ${trade.direction.toUpperCase()}`} sub={isNew ? `Recording into a ${user.activeMode} account` : `${trade.accountName} · ${trade.accountType.toUpperCase()}${trade.source === 'mt5_csv' ? ' · imported from MT5' : ''}${trade.corrected ? ' · manually corrected' : ''}`}>
+      <PageHead title={isNew ? 'New trade' : `${trade.symbol} ${trade.direction.toUpperCase()}`} sub={isNew ? `Recording into a ${user.activeMode} account` : `${trade.accountName} · ${trade.accountType.toUpperCase()}${trade.source === 'mt5_csv' ? ' · imported from MT5 CSV' : trade.source === 'mt5_sync' ? ' · synced from MT5' : ''}${trade.corrected ? ' · manually corrected' : ''}`}>
         <Link className="btn" to="/journal">Back</Link>
       </PageHead>
       <form onSubmit={save} className="stack">
         {err && <Alert kind="error">{err}</Alert>}
-        {trade?.source === 'mt5_csv' && <Alert kind="info">This trade was imported from MT5. Editing market data (prices, times, P&L) marks it as a manual correction.</Alert>}
+        {trade && trade.source !== 'manual' && <Alert kind="info">This trade came from MT5. Editing market data (prices, times, P&L) marks it as a manual correction.</Alert>}
         <div className="grid g3">
           <Card className="span2" title="Execution">
             <div className="form-grid">

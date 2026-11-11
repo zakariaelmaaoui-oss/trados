@@ -134,6 +134,25 @@ const step = async (name, fn) => {
     assert.equal(await page.getByRole('button', { name: /Import 0 trades/ }).isDisabled(), true, 're-import blocked as duplicate');
   });
 
+  await step('MT5 auto-sync: key created in Settings, EA push appears in the journal', async () => {
+    await page.goto(BASE + '/settings#mt5-sync');
+    await page.getByRole('button', { name: 'Create sync key' }).click();
+    const key = await page.getByLabel('Sync key').inputValue();
+    assert.match(key, /^tos_/);
+    const ea = await fetch(`${BASE}/api/mt5/positions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ account: { login: '5550001', server: 'Demo-Server', currency: 'USD', trade_mode: 'demo', server_gmt_offset_sec: 7200 },
+        positions: [{ ticket: '88001', symbol: 'USDJPY', type: 'sell', volume: 0.2, open_time: Date.parse('2026-11-10T08:00:00Z') / 1000 + 7200, close_time: Date.parse('2026-11-10T09:00:00Z') / 1000 + 7200, open_price: 154.2, close_price: 153.9, sl: 154.6, tp: 0, commission: -1.4, swap: 0, profit: 39.0 }] }),
+    }).then((r) => r.json());
+    assert.equal(ea.imported, 1);
+    await page.reload();
+    await page.getByText(/MT5 5550001/).waitFor();
+    await page.goto(BASE + '/journal');
+    await page.getByText('MT5 sync').first().waitFor();
+    const dl = await fetch(`${BASE}/downloads/TradeOS_Sync.mq5`).then((r) => r.text());
+    assert.match(dl, /api\/mt5\/positions/);
+  });
+
   await step('Demo and Live records remain separate (UI mode switch)', async () => {
     await page.goto(BASE + '/');
     await page.getByRole('group', { name: 'Account mode' }).getByRole('button', { name: 'Live' }).click();
@@ -144,7 +163,7 @@ const step = async (name, fn) => {
     await page.getByRole('group', { name: 'Account mode' }).getByRole('button', { name: 'Demo' }).click();
     await page.getByText(/Showing DEMO accounts only/).waitFor();
     const demo = await page.evaluate(() => fetch('/api/trades?mode=demo').then((r) => r.json()));
-    assert.equal(demo.trades.length, 3);
+    assert.equal(demo.trades.length, 4);
     await page.screenshot({ path: path.join(SHOTS, 'dashboard.png'), fullPage: true });
   });
 

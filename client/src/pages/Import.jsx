@@ -45,7 +45,7 @@ export default function ImportPage() {
 
   return (
     <>
-      <PageHead title="MT5 CSV Import" sub="Import closed positions from MetaTrader 5 history" />
+      <PageHead title="MT5 CSV Import" sub="Import closed positions from MetaTrader 5 history"><Link className="btn sm" to="/settings#mt5-sync"><Icon.refresh />Automatic MT5 sync</Link></PageHead>
       <div className="grid g3">
         <div className="span2 stack">
           <Card title="1. Choose the target account" icon={<Icon.shield />} sub="Demo and Live trades are stored separately — pick carefully.">

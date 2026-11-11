@@ -17,6 +17,14 @@ economic calendar with Web Push alerts, discipline tracking, and daily/weekly re
 VAPID keys are generated once and stored in the database (or set `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY`).
 Screenshots are stored in Postgres and resized in the browser (Vercel limits uploads to 4.5 MB).
 
+## MT5 auto-sync
+
+`client/public/downloads/TradeOS_Sync.mq5` is a read-only Expert Advisor. It pushes every closed
+position to `POST /api/mt5/positions` with a per-account sync key (Settings → MT5 auto-sync).
+The key decides the target account; a real MT5 account cannot push into a Demo account (and vice
+versa), and a key is bound to the first MT5 login that uses it. Tickets are position IDs, shared with
+the CSV import, so nothing is counted twice. MT5 must be running (PC or VPS) for the EA to sync.
+
 ## Run locally
 
 ```bash

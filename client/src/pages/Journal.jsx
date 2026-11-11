@@ -57,7 +57,7 @@ export default function Journal() {
                     <td className={`num ${signClass(t.netProfit)}`}>{t.closeTime ? money(t.netProfit, 'USD', { sign: true }) : <span className="badge accent">Open</span>}</td>
                     <td className="num">{t.rMultiple === null ? '—' : `${t.rMultiple}R`}</td>
                     <td>{t.planFollowed === null ? <span className="muted">—</span> : t.planFollowed ? <span className="badge pos">Yes</span> : <span className="badge neg">No</span>}</td>
-                    <td className="small">{t.source === 'mt5_csv' ? <span className="badge">MT5{t.corrected ? ' · edited' : ''}</span> : <span className="muted">Manual</span>}</td>
+                    <td className="small">{t.source === 'mt5_sync' ? <span className="badge accent">MT5 sync{t.corrected ? ' · edited' : ''}</span> : t.source === 'mt5_csv' ? <span className="badge">MT5 CSV{t.corrected ? ' · edited' : ''}</span> : <span className="muted">Manual</span>}</td>
                   </tr>
                 ))}
               </tbody>
