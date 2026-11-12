@@ -15,7 +15,7 @@
 //| trades.                                                          |
 //+------------------------------------------------------------------+
 #property copyright "TradeOS"
-#property version   "1.10"
+#property version   "1.11"
 #property description "Sync closed positions to TradeOS (read-only, never trades)."
 
 input string InpUrl         = "https://trados-eight.vercel.app"; // TradeOS address
@@ -40,6 +40,9 @@ int OnInit()
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && !MQLInfoInteger(MQL_TESTER))
       Print("TradeOS: tip - switch on Algo Trading so the EA keeps running.");
    EventSetTimer(MathMax(15, InpIntervalSec));
+   // OnInit also runs when you switch to another MT5 account (globals are kept),
+   // so always start with a full history scan for the account now logged in.
+   g_lastOkSync = 0;
    g_pending = true;
    Ping();
    SyncNow();
