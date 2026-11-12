@@ -98,7 +98,7 @@ function Accounts() {
           {(data?.accounts || []).map((a) => (
             <div className="list-item" key={a.id}>
               <span className={`badge ${a.type}`}>{a.type.toUpperCase()}</span>
-              <div className="grow"><div style={{ fontWeight: 600 }}>{a.name}</div><div className="tiny muted">{a.broker || 'No broker'} · {a.currency} · start {a.startingBalance} · server {fmtOffset(a.serverUtcOffsetMin)}</div></div>
+              <div className="grow" style={{ minWidth: 0 }}><div style={{ fontWeight: 600 }}>{a.name}{a.mt5Login && <span className="badge accent" style={{ marginLeft: 6 }}>MT5</span>}</div><div className="tiny muted">{a.mt5Login ? `${a.mt5Server} · ${a.currency} · ${a.autoBalance ? 'balance from MT5' : `start ${a.startingBalance}`}` : `${a.broker || 'No broker'} · ${a.currency} · start ${a.startingBalance} · server ${fmtOffset(a.serverUtcOffsetMin)}`}</div></div>
               <button className="btn sm ghost" onClick={() => setF({ ...a, startingBalance: String(a.startingBalance) })}>Edit</button>
               <button className="btn sm ghost danger" onClick={() => del(a)} aria-label="Delete account"><Icon.trash /></button>
             </div>
@@ -112,39 +112,30 @@ function Accounts() {
 function Mt5Sync() {
   const toast = useToast();
   const { user } = useAuth();
+  const keys = useLoad(() => api.get('/api/sync-keys'), []);
   const accounts = useLoad(() => api.get('/api/accounts'), []);
-  const all = accounts.data?.accounts || [];
-  const [accountId, setAccountId] = useState('');
-  const acc = all.find((a) => a.id === Number(accountId)) || all.find((a) => a.type === user.activeMode) || all[0];
-  const keys = useLoad(() => (acc ? api.get(`/api/accounts/${acc.id}/sync-keys`) : Promise.resolve({ keys: [] })), [acc?.id]);
   const [newKey, setNewKey] = useState(null);
   const [busy, setBusy] = useState(false);
   const site = window.location.origin;
-  useEffect(() => { setNewKey(null); }, [acc?.id]);
+  const connected = (accounts.data?.accounts || []).filter((a) => a.mt5Login);
+  const fresh = (iso) => iso && Date.now() - Date.parse(iso) < 15 * 60e3;
 
   const create = async () => {
     setBusy(true);
-    try { const r = await api.post(`/api/accounts/${acc.id}/sync-keys`); setNewKey(r.key); keys.reload(); }
+    try { const r = await api.post('/api/sync-keys'); setNewKey(r.key); keys.reload(); }
     catch (e) { toast(e.message, 'error'); } finally { setBusy(false); }
   };
   const revoke = async (k) => {
-    if (!confirm('Revoke this key? The EA using it will stop syncing.')) return;
+    if (!confirm('Revoke this key? MT5 terminals using it will stop syncing.')) return;
     try { await api.del(`/api/sync-keys/${k.id}`); keys.reload(); toast('Key revoked'); } catch (e) { toast(e.message, 'error'); }
   };
   const copy = async (text) => {
     try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast('Select the text and copy it manually', 'error'); }
   };
-  if (!acc) return null;
   return (
-    <Card title="MT5 auto-sync" icon={<Icon.refresh />} sub="Every position you close in MetaTrader 5 appears in your journal automatically">
+    <Card title="Connect MetaTrader 5" icon={<Icon.refresh />} sub="Your MT5 accounts and every closed position appear here automatically — nothing to type">
       <div className="grid g2">
         <div className="stack">
-          <Field label="TradeOS account to sync into">
-            <select className="input" value={acc.id} onChange={(e) => setAccountId(e.target.value)}>
-              {all.map((a) => <option key={a.id} value={a.id}>{a.name} ({a.type.toUpperCase()})</option>)}
-            </select>
-          </Field>
-          <Alert kind="info">Use a <b>{acc.type === 'live' ? 'LIVE' : 'DEMO'}</b> MT5 account with this key. TradeOS refuses trades from a {acc.type === 'live' ? 'demo' : 'real'} MT5 account so Demo and Live never mix.</Alert>
           {newKey ? (
             <div className="stack" style={{ gap: 8 }}>
               <Alert kind="warn">Copy this key now — it is shown only once.</Alert>
@@ -154,38 +145,52 @@ function Mt5Sync() {
               </div>
             </div>
           ) : (
-            <button className="btn primary" disabled={busy} onClick={create}><Icon.plus />Create sync key</button>
+            <button className="btn primary" disabled={busy} onClick={create}><Icon.plus />Connect MT5</button>
           )}
+          <Alert kind="info">One key works for all your MT5 accounts. Each MT5 account gets its own TradeOS account with the broker, <b>Demo or Live</b> and the <b>balance</b> read from MT5 — Demo and Live never mix.</Alert>
           <div>
-            <div className="small" style={{ fontWeight: 600, marginBottom: 6 }}>Connected keys</div>
-            {(keys.data?.keys || []).length === 0 ? <p className="small muted">No keys yet for this account.</p> : (
+            <div className="small" style={{ fontWeight: 600, marginBottom: 6 }}>Connected MT5 accounts</div>
+            {connected.length === 0 ? <p className="small muted">None yet — they appear here when the EA connects.</p> : (
               <div className="list">
-                {keys.data.keys.map((k) => (
-                  <div className="list-item" key={k.id}>
-                    <span className={`dot`} style={{ background: k.lastUsedAt && Date.now() - Date.parse(k.lastUsedAt) < 15 * 60e3 ? 'var(--pos)' : 'var(--low)' }} />
+                {connected.map((a) => (
+                  <div className="list-item" key={a.id}>
+                    <span className="dot" style={{ background: fresh(a.lastSyncAt) ? 'var(--pos)' : 'var(--low)' }} />
                     <div className="grow" style={{ minWidth: 0 }}>
-                      <div className="small mono">tos_…{k.hint}{k.mt5Login ? ` · MT5 ${k.mt5Login}` : ''}</div>
-                      <div className="tiny muted" style={{ overflowWrap: 'anywhere' }}>
-                        {k.lastUsedAt ? `Last sync ${fmtDateTime(k.lastUsedAt, user.timezone)} · ${k.lastImported ?? 0} new` : 'Waiting for the EA to connect…'}{k.mt5Server ? ` · ${k.mt5Server}` : ''}
-                      </div>
+                      <div className="small" style={{ fontWeight: 600 }}>{a.name} <span className={`badge ${a.type}`}>{a.type.toUpperCase()}</span></div>
+                      <div className="tiny muted" style={{ overflowWrap: 'anywhere' }}>{a.mt5Server} · {a.currency} · {a.lastSyncAt ? `last sync ${fmtDateTime(a.lastSyncAt, user.timezone)}` : 'waiting…'}</div>
                     </div>
-                    <button className="btn sm ghost danger" onClick={() => revoke(k)}>Revoke</button>
                   </div>
                 ))}
               </div>
             )}
           </div>
+          {(keys.data?.keys || []).length > 0 && (
+            <div>
+              <div className="small" style={{ fontWeight: 600, marginBottom: 6 }}>Keys</div>
+              <div className="list">
+                {keys.data.keys.map((k) => (
+                  <div className="list-item" key={k.id}>
+                    <div className="grow" style={{ minWidth: 0 }}>
+                      <div className="small mono">tos_…{k.hint}</div>
+                      <div className="tiny muted">{k.auto ? 'All MT5 accounts' : `Only ${k.accountName}`} · {k.lastUsedAt ? `used ${fmtDateTime(k.lastUsedAt, user.timezone)}` : 'not used yet'}</div>
+                    </div>
+                    <button className="btn sm ghost danger" onClick={() => revoke(k)}>Revoke</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
         <div className="stack" style={{ gap: 10 }}>
-          <div className="small" style={{ fontWeight: 600 }}>Setup on your PC (MT5 must stay open)</div>
+          <div className="small" style={{ fontWeight: 600 }}>Setup on your PC (once)</div>
           <ol className="small text-2" style={{ paddingLeft: 18, margin: 0, display: 'grid', gap: 8 }}>
+            <li>Click <b>Connect MT5</b> and copy the key.</li>
             <li><a href="/downloads/TradeOS_Sync.mq5" download>Download TradeOS_Sync.mq5</a>.</li>
-            <li>In MT5: <b>File → Open Data Folder</b> → open <b>MQL5 → Experts</b> → paste the file there. In the Navigator, right-click <b>Expert Advisors → Refresh</b>.</li>
+            <li>In MT5: <b>File → Open Data Folder</b> → <b>MQL5 → Experts</b> → paste the file. In the Navigator, right-click <b>Expert Advisors → Refresh</b>.</li>
             <li><b>Tools → Options → Expert Advisors</b>: tick <b>Allow WebRequest for listed URL</b> and add <span className="mono" style={{ overflowWrap: 'anywhere' }}>{site}</span> <button className="btn sm ghost" type="button" onClick={() => copy(site)}>Copy</button></li>
-            <li>Drag <b>TradeOS_Sync</b> onto any one chart. In <b>Inputs</b>, paste your sync key in <b>InpKey</b> (and check <b>InpUrl</b> is {site}). Click OK.</li>
-            <li>Turn on <b>Algo Trading</b>. The chart shows “Connected to TradeOS”. Closed positions from the last 30 days are imported, then every new close within about a minute.</li>
+            <li>Drag <b>TradeOS_Sync</b> onto any chart, paste the key in <b>InpKey</b>, OK. Turn on <b>Algo Trading</b>.</li>
           </ol>
-          <p className="tiny muted">The EA only reads your history — it never opens, changes or closes trades. Positions already imported by CSV are not duplicated.</p>
+          <p className="tiny muted">Trades you take on your phone sync when MT5 on your PC is opened on the same account (last 30 days; set InpDaysBack to 365 for more). The EA only reads history — it never opens, changes or closes trades. Your MT5 password is never needed.</p>
         </div>
       </div>
     </Card>

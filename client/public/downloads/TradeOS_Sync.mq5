@@ -6,14 +6,16 @@
 //|  1. Tools > Options > Expert Advisors: tick "Allow WebRequest    |
 //|     for listed URL" and add your TradeOS address, e.g.           |
 //|     https://trados-eight.vercel.app                              |
-//|  2. Drag this EA onto ANY one chart, paste your sync key, OK.    |
+//|  2. Drag this EA onto ANY one chart, paste your key, OK.         |
+//|     Your MT5 account (broker, Demo/Live, balance) is created in  |
+//|     TradeOS automatically - nothing to type on the website.      |
 //|  3. Keep "Algo Trading" switched on. MT5 must stay open.         |
 //|                                                                  |
 //| The EA only READS history. It never opens, modifies or closes    |
 //| trades.                                                          |
 //+------------------------------------------------------------------+
 #property copyright "TradeOS"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Sync closed positions to TradeOS (read-only, never trades)."
 
 input string InpUrl         = "https://trados-eight.vercel.app"; // TradeOS address
@@ -204,7 +206,9 @@ bool SendBatch(string items, int count, int &imported)
    string payload = "{\"account\":{";
    payload += "\"login\":\"" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "\",";
    payload += "\"server\":\"" + JsonEscape(AccountInfoString(ACCOUNT_SERVER)) + "\",";
+   payload += "\"company\":\"" + JsonEscape(AccountInfoString(ACCOUNT_COMPANY)) + "\",";
    payload += "\"currency\":\"" + JsonEscape(AccountInfoString(ACCOUNT_CURRENCY)) + "\",";
+   payload += "\"balance\":" + Num(AccountInfoDouble(ACCOUNT_BALANCE), 2) + ",";
    payload += "\"trade_mode\":\"" + TradeMode() + "\",";
    payload += "\"server_gmt_offset_sec\":" + IntegerToString(offset);
    payload += "},\"positions\":[" + items + "]}";

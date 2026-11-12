@@ -20,9 +20,10 @@ Screenshots are stored in Postgres and resized in the browser (Vercel limits upl
 ## MT5 auto-sync
 
 `client/public/downloads/TradeOS_Sync.mq5` is a read-only Expert Advisor. It pushes every closed
-position to `POST /api/mt5/positions` with a per-account sync key (Settings → MT5 auto-sync).
-The key decides the target account; a real MT5 account cannot push into a Demo account (and vice
-versa), and a key is bound to the first MT5 login that uses it. Tickets are position IDs, shared with
+position to `POST /api/mt5/positions` with a key from Settings → Connect MetaTrader 5.
+A connect key creates one TradeOS account per MT5 login automatically (broker name, Demo/Live from
+the terminal's trade mode, currency, and a starting balance that follows the real MT5 balance until
+edited by hand). Older account-bound keys still work and refuse a terminal of the other type. Tickets are position IDs, shared with
 the CSV import, so nothing is counted twice. MT5 must be running (PC or VPS) for the EA to sync.
 
 ## Run locally

@@ -14,9 +14,12 @@ export function newSyncToken() {
 export async function findToken(db, header) {
   const m = /^Bearer\s+(tos_[A-Za-z0-9_-]{20,60})\s*$/.exec(header || '');
   if (!m) return null;
-  return db.get(`SELECT st.*, a.type AS account_type, a.name AS account_name, a.starting_balance, a.id AS acc_id
-                 FROM sync_tokens st JOIN accounts a ON a.id = st.account_id AND a.user_id = st.user_id
-                 WHERE st.token_hash = ? AND st.revoked = 0`, sha256(m[1]));
+  // account_id NULL = "Connect MT5" key: accounts are created/matched from the terminal's login.
+  const t = await db.get(`SELECT st.*, a.type AS account_type, a.name AS account_name, a.starting_balance
+                          FROM sync_tokens st LEFT JOIN accounts a ON a.id = st.account_id AND a.user_id = st.user_id
+                          WHERE st.token_hash = ? AND st.revoked = 0`, sha256(m[1]));
+  if (t && t.account_id && !t.account_type) return null; // account deleted
+  return t || null;
 }
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
@@ -61,7 +64,10 @@ export function validatePayload(body, { now = Date.now() } = {}) {
       commission: p.commission, swap: p.swap, profit: p.profit,
     });
   }
-  const login = acct.login !== undefined ? String(acct.login).slice(0, 30) : null;
-  const server = typeof acct.server === 'string' ? acct.server.slice(0, 80) : null;
-  return { valid, invalid, tradeMode, login, server, offsetMs };
+  const login = acct.login !== undefined && /^\d{1,20}$/.test(String(acct.login)) ? String(acct.login) : null;
+  const server = typeof acct.server === 'string' && acct.server.trim() ? acct.server.trim().slice(0, 80) : null;
+  const company = typeof acct.company === 'string' && acct.company.trim() ? acct.company.trim().slice(0, 80) : null;
+  const currency = typeof acct.currency === 'string' && /^[A-Z]{3}$/.test(acct.currency.trim().toUpperCase()) ? acct.currency.trim().toUpperCase() : 'USD';
+  const balance = isNum(acct.balance) && Math.abs(acct.balance) < 1e12 ? acct.balance : null;
+  return { valid, invalid, tradeMode, login, server, company, currency, balance, offsetMs };
 }

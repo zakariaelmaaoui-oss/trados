@@ -128,3 +128,78 @@ test('payload validation: missing offset, too many positions, bad JSON', async (
   assert.equal(bad.status, 400);
   assert.equal((await ea(key, payload([]))).status, 200);
 });
+
+test('Connect MT5 key: account created automatically from the terminal (name, Demo/Live, balance)', async () => {
+  const { c } = await registerUser(app.base, 'auto@example.com');
+  const k = await c.post('/api/sync-keys');
+  assert.equal(k.status, 201);
+  const key = k.data.key;
+  const ping = await (await fetch(`${app.base}/api/mt5/ping`, { headers: { Authorization: `Bearer ${key}` } })).json();
+  assert.equal(ping.type, 'auto');
+
+  // Demo terminal, balance 10 196.50 after one +196.50 trade.
+  const demoAcct = { login: '61000001', server: 'ICMarketsSC-Demo', company: 'Raw Trading Ltd', currency: 'USD', trade_mode: 'demo', balance: 10196.5 };
+  const r = await ea(key, payload([pos(5001)], demoAcct));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.account, 'Raw Trading Ltd 61000001');
+  let accounts = (await c.get('/api/accounts')).data.accounts;
+  const auto = accounts.find((a) => a.mt5Login === '61000001');
+  assert.equal(auto.type, 'demo');
+  assert.equal(auto.broker, 'Raw Trading Ltd');
+  assert.equal(auto.startingBalance, 10000);
+  assert.equal(auto.autoBalance, true);
+  assert.equal(auto.serverUtcOffsetMin, 120);
+  const t = (await c.get(`/api/trades?mode=demo&account=${auto.id}`)).data.trades[0];
+  assert.equal(t.riskAmount, 100, '1% of the balance before the trade');
+  let dash = (await c.get('/api/dashboard?mode=demo')).data;
+
+  // Same key, real terminal → a separate LIVE account, never mixed with demo.
+  const liveAcct = { login: '72000002', server: 'ICMarketsSC-Live07', company: 'Raw Trading Ltd', currency: 'EUR', trade_mode: 'real', balance: 2500 };
+  assert.equal((await ea(key, payload([pos(9001, { profit: -40 })], liveAcct))).data.imported, 1);
+  accounts = (await c.get('/api/accounts')).data.accounts;
+  const live = accounts.find((a) => a.mt5Login === '72000002');
+  assert.equal(live.type, 'live');
+  assert.equal(live.currency, 'EUR');
+  assert.deepEqual((await c.get('/api/trades?mode=live')).data.trades.map((x) => x.ticket), ['9001']);
+  assert.ok(!(await c.get('/api/trades?mode=demo')).data.trades.some((x) => x.ticket === '9001'));
+
+  // Re-sync: no duplicate account, no duplicate trades; balance follows MT5 (e.g. after a deposit).
+  await ea(key, payload([pos(5001)], { ...demoAcct, balance: 11196.5 }));
+  accounts = (await c.get('/api/accounts')).data.accounts;
+  assert.equal(accounts.filter((a) => a.mt5Login === '61000001').length, 1);
+  assert.equal(accounts.find((a) => a.mt5Login === '61000001').startingBalance, 11000);
+  dash = (await c.get(`/api/dashboard?mode=demo`)).data;
+  assert.ok(dash.balance.current >= 11196.5, 'dashboard shows the real MT5 balance');
+
+  // Editing the starting balance by hand stops auto-follow; Demo/Live can't be flipped.
+  assert.equal((await c.patch(`/api/accounts/${auto.id}`, { startingBalance: 5000 })).data.account.autoBalance, false);
+  await ea(key, payload([], { ...demoAcct, balance: 99999 }));
+  assert.equal((await c.get('/api/accounts')).data.accounts.find((a) => a.id === auto.id).startingBalance, 5000);
+  assert.equal((await c.patch(`/api/accounts/${auto.id}`, { type: 'live' })).status, 400);
+
+  // Empty heartbeat from a brand-new terminal still creates its account.
+  await ea(key, payload([], { ...demoAcct, login: '61000009', balance: 500 }));
+  assert.ok((await c.get('/api/accounts')).data.accounts.some((a) => a.mt5Login === '61000009' && a.startingBalance === 500));
+
+  // Old EA without login/trade_mode can't use a connect key.
+  assert.equal((await ea(key, { account: { server_gmt_offset_sec: 7200 }, positions: [] })).status, 400);
+  // Keys listed (without the secret) and revocable
+  const list = (await c.get('/api/sync-keys')).data.keys;
+  assert.equal(list.length, 1);
+  assert.equal(list[0].auto, true);
+  assert.ok(!JSON.stringify(list).includes(key));
+});
+
+test('Connect MT5 key privacy: the same MT5 login under two TradeOS users stays separate', async () => {
+  const { c: a } = await registerUser(app.base, 'autoA@example.com');
+  const { c: b } = await registerUser(app.base, 'autoB@example.com');
+  const ka = (await a.post('/api/sync-keys')).data.key;
+  const kb = (await b.post('/api/sync-keys')).data.key;
+  const acct = { login: '123', server: 'S', company: 'B', trade_mode: 'demo', balance: 1000 };
+  await ea(ka, payload([pos(1)], acct));
+  await ea(kb, payload([pos(2)], acct));
+  assert.deepEqual((await a.get('/api/trades?mode=demo')).data.trades.map((t) => t.ticket), ['1']);
+  assert.deepEqual((await b.get('/api/trades?mode=demo')).data.trades.map((t) => t.ticket), ['2']);
+  assert.equal((await b.get('/api/sync-keys')).data.keys.length, 1);
+});

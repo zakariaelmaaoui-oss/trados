@@ -272,6 +272,14 @@ CREATE TABLE IF NOT EXISTS sync_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_sync_tokens_account ON sync_tokens(account_id);
 
+-- MT5 "Connect" keys (account_id NULL) create one TradeOS account per MT5 login automatically.
+ALTER TABLE sync_tokens ALTER COLUMN account_id DROP NOT NULL;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS mt5_login TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS mt5_server TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auto_balance INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_sync_at ${TS};
+CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_mt5 ON accounts(user_id, mt5_login, mt5_server) WHERE mt5_login IS NOT NULL;
+
 -- Migration for databases created before MT5 auto-sync existed.
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'trades_source_check' AND pg_get_constraintdef(oid) LIKE '%mt5_sync%') THEN

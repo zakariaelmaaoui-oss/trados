@@ -116,28 +116,52 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     next();
   });
   app.get('/api/mt5/ping', eaLimiter, eaAuth, (req, res) => {
-    res.json({ ok: true, account: req.syncToken.account_name, type: req.syncToken.account_type });
+    const t = req.syncToken;
+    res.json(t.account_id ? { ok: true, account: t.account_name, type: t.account_type } : { ok: true, account: null, type: 'auto', note: 'Your MT5 account will be created in TradeOS automatically.' });
   });
+
+  /** Find or create the TradeOS account for this MT5 login ("Connect MT5" keys). */
+  const resolveAutoAccount = async (tok, v, termType) => {
+    let acc = await db.get('SELECT * FROM accounts WHERE user_id=? AND mt5_login=? AND mt5_server=?', tok.user_id, v.login, v.server);
+    if (!acc) {
+      // Balance before the trades we are about to import = current balance − their net result.
+      const netNew = v.valid.reduce((a, p) => a + p.profit + p.commission + p.swap, 0);
+      const start = v.balance !== null ? Math.max(0, Math.round((v.balance - netNew) * 100) / 100) : 0;
+      const name = `${v.company || v.server} ${v.login}`.slice(0, 80);
+      await db.run(`INSERT INTO accounts(user_id,name,type,broker,currency,starting_balance,server_utc_offset_min,mt5_login,mt5_server,auto_balance)
+                    VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT (user_id, mt5_login, mt5_server) WHERE mt5_login IS NOT NULL DO NOTHING`,
+      tok.user_id, name, termType, v.company, v.currency, start, Math.round(v.offsetMs / 60000), v.login, v.server);
+      acc = await db.get('SELECT * FROM accounts WHERE user_id=? AND mt5_login=? AND mt5_server=?', tok.user_id, v.login, v.server);
+    }
+    return acc;
+  };
+
   app.post('/api/mt5/positions', eaLimiter, express.json({ limit: '1mb' }), eaAuth, wrap(async (req, res) => {
     const tok = req.syncToken;
     const v = validatePayload(req.body, { now: now().getTime() });
     if (v.error) throw bad(v.error);
-    // Demo/Live protection: the terminal's account type must match the TradeOS account.
-    if (v.tradeMode) {
-      const termType = v.tradeMode === 'real' ? 'live' : 'demo';
-      if (termType !== tok.account_type) {
+    const termType = v.tradeMode ? (v.tradeMode === 'real' ? 'live' : 'demo') : null;
+    let acc;
+    if (tok.account_id) {
+      // Key bound to one TradeOS account: the terminal's account type must match it.
+      if (termType && termType !== tok.account_type) {
         return res.status(409).json({ error: `This MT5 terminal is a ${termType.toUpperCase()} account but the key belongs to the ${tok.account_type.toUpperCase()} account "${tok.account_name}". Use a key from a ${termType} account.` });
       }
-    }
-    // One MT5 login per key: refuse a different login so two terminals can't mix into one account.
-    if (tok.mt5_login && v.login && tok.mt5_login !== v.login) {
-      return res.status(409).json({ error: `This key is already linked to MT5 account ${tok.mt5_login}. Create a separate key for MT5 account ${v.login}.` });
+      // One MT5 login per key: refuse a different login so two terminals can't mix into one account.
+      if (tok.mt5_login && v.login && tok.mt5_login !== v.login) {
+        return res.status(409).json({ error: `This key is already linked to MT5 account ${tok.mt5_login}. Create a separate key for MT5 account ${v.login}.` });
+      }
+      acc = await db.get('SELECT * FROM accounts WHERE id=? AND user_id=?', tok.account_id, tok.user_id);
+    } else {
+      // "Connect MT5" key: one TradeOS account per MT5 login, created automatically.
+      if (!v.login || !v.server || !termType) throw bad('account.login, account.server and account.trade_mode are required — update the TradeOS EA.');
+      acc = await resolveAutoAccount(tok, v, termType);
+      if (acc.type !== termType) return res.status(409).json({ error: `MT5 account ${v.login} is linked to a ${acc.type.toUpperCase()} TradeOS account but now reports ${termType.toUpperCase()}.` });
     }
     const user = await db.get('SELECT default_risk_pct FROM users WHERE id=?', tok.user_id);
-    const acc = { id: tok.account_id, starting_balance: tok.starting_balance };
     const tickets = v.valid.map((p) => p.ticket);
     const existing = new Set(tickets.length
-      ? (await db.all(`SELECT ticket FROM trades WHERE account_id=? AND ticket IN (${tickets.map(() => '?').join(',')})`, tok.account_id, ...tickets)).map((r) => r.ticket)
+      ? (await db.all(`SELECT ticket FROM trades WHERE account_id=? AND ticket IN (${tickets.map(() => '?').join(',')})`, acc.id, ...tickets)).map((r) => r.ticket)
       : []);
     const fresh = v.valid.filter((p) => !existing.has(p.ticket)).sort((a, b) => a.open_time.localeCompare(b.open_time));
     let imported = 0;
@@ -148,14 +172,20 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
           const risk = await riskAmountFor(t, acc, user.default_risk_pct, x.open_time);
           const r = await t.run(`INSERT INTO trades(user_id,account_id,ticket,source,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount)
                                  VALUES(?,?,?,'mt5_sync',?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (account_id, ticket) DO NOTHING`,
-          tok.user_id, tok.account_id, x.ticket, x.symbol, x.direction, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, user.default_risk_pct, risk);
+          tok.user_id, acc.id, x.ticket, x.symbol, x.direction, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, user.default_risk_pct, risk);
           if (r.changes) { imported++; importedTickets.push(x.ticket); }
         }
       });
     }
+    // Auto-created accounts follow the real MT5 balance: starting balance = balance − net of synced trades.
+    if (acc.auto_balance && v.balance !== null) {
+      await db.run(`UPDATE accounts SET starting_balance = ?::float8 - (SELECT COALESCE(SUM(COALESCE(profit,0)+commission+swap),0)::float8 FROM trades WHERE account_id=? AND close_time IS NOT NULL),
+                    currency=?, server_utc_offset_min=? WHERE id=?`, v.balance, acc.id, v.currency, Math.round(v.offsetMs / 60000), acc.id);
+    }
+    await db.run('UPDATE accounts SET last_sync_at=? WHERE id=?', now().toISOString(), acc.id);
     await db.run('UPDATE sync_tokens SET last_used_at=?, last_received=?, last_imported=?, mt5_login=COALESCE(mt5_login, ?), mt5_server=COALESCE(?, mt5_server) WHERE id=?',
-      now().toISOString(), req.body.positions.length, imported, v.login, v.server, tok.id);
-    res.json({ ok: true, account: tok.account_name, type: tok.account_type, received: req.body.positions.length, imported, duplicates: v.valid.length - fresh.length, invalid: v.invalid, importedTickets });
+      now().toISOString(), req.body.positions.length, imported, tok.account_id ? v.login : null, tok.account_id ? v.server : null, tok.id);
+    res.json({ ok: true, account: acc.name, type: acc.type, received: req.body.positions.length, imported, duplicates: v.valid.length - fresh.length, invalid: v.invalid, importedTickets });
   }));
 
   app.use('/api', express.json({ limit: '200kb' }));
@@ -237,7 +267,7 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
   app.use('/api', (req, res, next) => (req.path.startsWith('/push/vapid') ? next() : requireUser(req, res, next)));
 
   // ---- accounts -----------------------------------------------------------------
-  const accountView = (a) => ({ id: a.id, name: a.name, type: a.type, broker: a.broker, currency: a.currency, startingBalance: a.starting_balance, serverUtcOffsetMin: a.server_utc_offset_min });
+  const accountView = (a) => ({ id: a.id, name: a.name, type: a.type, broker: a.broker, currency: a.currency, startingBalance: a.starting_balance, serverUtcOffsetMin: a.server_utc_offset_min, mt5Login: a.mt5_login ?? null, mt5Server: a.mt5_server ?? null, autoBalance: !!a.auto_balance, lastSyncAt: a.last_sync_at ?? null });
   const readAccount = (b, cur = {}) => ({
     name: b.name !== undefined ? str(b.name, { required: true, max: 80, name: 'Account name' }) : cur.name,
     type: b.type !== undefined ? (['demo', 'live'].includes(b.type) ? b.type : (() => { throw bad('Account type must be demo or live'); })()) : cur.type,
@@ -262,8 +292,11 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     const a = readAccount(req.body, cur);
     if (a.type !== cur.type && (await count('SELECT COUNT(*)::int c FROM trades WHERE account_id=?', cur.id)) > 0)
       throw bad('Cannot change Demo/Live type of an account that has trades — create a new account instead');
-    await db.run('UPDATE accounts SET name=?, type=?, broker=?, currency=?, starting_balance=?, server_utc_offset_min=? WHERE id=? AND user_id=?',
-      a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min, cur.id, req.user.id);
+    if (cur.mt5_login && a.type !== cur.type) throw bad('Demo/Live of an MT5-connected account comes from MT5 and cannot be changed');
+    // Editing the starting balance by hand stops it following the MT5 balance.
+    const auto = req.body.startingBalance !== undefined && Number(req.body.startingBalance) !== cur.starting_balance ? 0 : cur.auto_balance;
+    await db.run('UPDATE accounts SET name=?, type=?, broker=?, currency=?, starting_balance=?, server_utc_offset_min=?, auto_balance=? WHERE id=? AND user_id=?',
+      a.name, a.type, a.broker, a.currency, a.starting_balance, a.server_utc_offset_min, auto, cur.id, req.user.id);
     res.json({ account: accountView(await ownAccount(req.user.id, cur.id)) });
   }));
   app.delete('/api/accounts/:id', wrap(async (req, res) => {
@@ -288,6 +321,17 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     const row = await db.get('INSERT INTO sync_tokens(user_id,account_id,token_hash,token_hint) VALUES(?,?,?,?) RETURNING *', req.user.id, acc.id, hash, hint);
     // The full key is only ever shown once; only its hash is stored.
     res.status(201).json({ key: token, info: tokenView(row), account: accountView(acc) });
+  }));
+  // "Connect MT5" keys: not tied to an account; each MT5 login gets its own TradeOS account.
+  app.get('/api/sync-keys', wrap(async (req, res) => {
+    const rows = await db.all('SELECT st.*, a.name AS account_name FROM sync_tokens st LEFT JOIN accounts a ON a.id=st.account_id WHERE st.user_id=? AND st.revoked=0 ORDER BY st.id DESC', req.user.id);
+    res.json({ keys: rows.map((t) => ({ ...tokenView(t), accountId: t.account_id, accountName: t.account_name ?? null, auto: !t.account_id })) });
+  }));
+  app.post('/api/sync-keys', wrap(async (req, res) => {
+    if ((await count('SELECT COUNT(*)::int c FROM sync_tokens WHERE user_id=? AND account_id IS NULL AND revoked=0', req.user.id)) >= 5) throw bad('Maximum 5 active connect keys. Revoke an old key first.');
+    const { token, hash, hint } = newSyncToken();
+    const row = await db.get('INSERT INTO sync_tokens(user_id,account_id,token_hash,token_hint) VALUES(?,NULL,?,?) RETURNING *', req.user.id, hash, hint);
+    res.status(201).json({ key: token, info: { ...tokenView(row), auto: true } });
   }));
   app.delete('/api/sync-keys/:id', wrap(async (req, res) => {
     const r = await db.run('UPDATE sync_tokens SET revoked=1 WHERE id=? AND user_id=? AND revoked=0', idOf(req.params.id), req.user.id);
