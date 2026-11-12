@@ -8,6 +8,7 @@ import AuthPage from './pages/Auth.jsx';
 import Dashboard from './pages/Dashboard.jsx';
 import Journal from './pages/Journal.jsx';
 import TradeEditor from './pages/TradeEditor.jsx';
+import QuickTrade from './pages/QuickTrade.jsx';
 import ImportPage from './pages/Import.jsx';
 import Planner from './pages/Planner.jsx';
 import WeeklyReview from './pages/WeeklyReview.jsx';
@@ -127,6 +128,7 @@ function Gate() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/journal" element={<Journal />} />
+        <Route path="/journal/quick" element={<QuickTrade />} />
         <Route path="/journal/new" element={<TradeEditor />} />
         <Route path="/journal/:id" element={<TradeEditor />} />
         <Route path="/import" element={<ImportPage />} />

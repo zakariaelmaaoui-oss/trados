@@ -19,7 +19,8 @@ export default function Journal() {
     <>
       <PageHead title="Trading Journal" sub="Every trade, with notes, risk and screenshots">
         <Link className="btn" to="/import"><Icon.upload />Import MT5</Link>
-        <Link className="btn primary" to="/journal/new"><Icon.plus />New trade</Link>
+        <Link className="btn" to="/journal/new">Full form</Link>
+        <Link className="btn primary" to="/journal/quick"><Icon.plus />Quick trade</Link>
       </PageHead>
       <Card>
         <div className="form-grid" style={{ marginBottom: 16 }}>
@@ -35,7 +36,7 @@ export default function Journal() {
         </div>
         {error && <Alert kind="error">{error.message}</Alert>}
         {loading && !data ? <Loading /> : data && data.trades.length === 0 ? (
-          <Empty icon={<Icon.journal />} action={<div className="row" style={{ justifyContent: 'center' }}><Link className="btn sm primary" to="/journal/new">Record a trade</Link><Link className="btn sm" to="/import">Import MT5 CSV</Link></div>}>
+          <Empty icon={<Icon.journal />} action={<div className="row" style={{ justifyContent: 'center' }}><Link className="btn sm primary" to="/journal/quick">Record a trade</Link><Link className="btn sm" to="/import">Import MT5 CSV</Link></div>}>
             No {user.activeMode} trades match these filters.
           </Empty>
         ) : data && (

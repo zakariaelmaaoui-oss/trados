@@ -319,6 +319,38 @@ const step = async (name, fn) => {
     await m.close();
   });
 
+  await step('Quick trade on a phone: taps only, profit calculated, saved to the journal', async () => {
+    const m = await browser.newContext({ ...require('playwright').devices['iPhone 13'], storageState: await ctx.storageState() });
+    const mp = await m.newPage();
+    mp.on('pageerror', (e) => errors.push(e.message));
+    await mp.goto(BASE + '/');
+    await mp.getByRole('link', { name: 'New trade' }).click();
+    await mp.getByRole('heading', { name: 'Quick trade' }).waitFor();
+    await mp.getByRole('group', { name: 'Direction' }).getByRole('button', { name: 'Sell' }).click();
+    await mp.getByRole('button', { name: 'GBPUSD', exact: true }).click();
+    await mp.getByRole('button', { name: '0.5', exact: true }).click();
+    await mp.getByLabel('Entry price').fill('1.2750');
+    await mp.getByLabel('Exit price').fill('1.2720');
+    assert.equal(await mp.getByLabel(/^Profit/).inputValue(), '150', 'profit calculated: 30 pips × 0.5 lot');
+    await mp.getByText('Calculated · 100 000 units per lot').waitFor();
+    await mp.getByRole('button', { name: '1h', exact: true }).click();
+    await mp.getByRole('button', { name: 'Yes', exact: true }).click();
+    assert.equal(await mp.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1), false, 'no horizontal scroll');
+    await mp.screenshot({ path: path.join(SHOTS, 'mobile-quick.png') });
+    await mp.getByRole('button', { name: /^Save GBPUSD/ }).click();
+    await mp.getByText('GBPUSD SELL saved').waitFor();
+    await mp.screenshot({ path: path.join(SHOTS, 'mobile-quick-saved.png') });
+    const t = (await mp.evaluate(() => fetch('/api/trades?mode=demo').then((r) => r.json()))).trades.find((x) => x.symbol === 'GBPUSD' && x.profit === 150);
+    assert.ok(t, 'trade stored');
+    assert.equal(Date.parse(t.closeTime) - Date.parse(t.openTime), 3600e3, 'held 1h');
+    assert.equal(t.planFollowed, true);
+    assert.equal(t.direction, 'sell');
+    await mp.getByRole('button', { name: 'Add another' }).click();
+    await mp.getByLabel('Entry price').waitFor();
+    assert.equal(await mp.getByLabel('Entry price').inputValue(), '');
+    await m.close();
+  });
+
   await step('PWA: manifest and service worker served', async () => {
     const man = await page.evaluate(() => fetch('/manifest.webmanifest').then((r) => r.json()));
     assert.equal(man.display, 'standalone');

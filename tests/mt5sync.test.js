@@ -203,3 +203,30 @@ test('Connect MT5 key privacy: the same MT5 login under two TradeOS users stays 
   assert.deepEqual((await b.get('/api/trades?mode=demo')).data.trades.map((t) => t.ticket), ['2']);
   assert.equal((await b.get('/api/sync-keys')).data.keys.length, 1);
 });
+
+test('a trade typed in on the phone is completed by the later MT5 sync, not duplicated', async () => {
+  const { c } = await registerUser(app.base, 'phone@example.com');
+  const key = (await c.post('/api/sync-keys')).data.key;
+  const acct = { login: '7001', server: 'B-Demo', company: 'B', trade_mode: 'demo', balance: 10196.5 };
+  await ea(key, payload([], acct)); // PC connected once → account exists
+  const acc = (await c.get('/api/accounts')).data.accounts.find((a) => a.mt5Login === '7001');
+  // On the phone: approximate times, estimated profit, notes.
+  const manual = (await c.post('/api/trades', { accountId: acc.id, symbol: 'EURUSD', direction: 'buy', volume: 0.5, openTime: '2026-11-10T09:05:00Z', closeTime: '2026-11-10T10:40:00Z', openPrice: 1.081, closePrice: 1.085, profit: 200, notes: 'from phone', planFollowed: true })).data.trade;
+  // Unrelated manual trade (different lots) must stay separate.
+  await c.post('/api/trades', { accountId: acc.id, symbol: 'EURUSD', direction: 'buy', volume: 1, openTime: '2026-11-10T09:05:00Z', closeTime: '2026-11-10T10:40:00Z', openPrice: 1.081, closePrice: 1.085, profit: 400 });
+  // Later the PC syncs the real position (broker symbol suffix, exact times, commission).
+  const r = await ea(key, payload([pos(4242, { symbol: 'EURUSD.r' })], acct));
+  assert.equal(r.data.matched, 1);
+  assert.equal(r.data.imported, 0);
+  const trades = (await c.get(`/api/trades?mode=demo&account=${acc.id}`)).data.trades;
+  assert.equal(trades.length, 2, 'no duplicate');
+  const t = trades.find((x) => x.id === manual.id);
+  assert.equal(t.ticket, '4242');
+  assert.equal(t.source, 'mt5_sync');
+  assert.equal(t.openTime, '2026-11-10T09:15:00.000Z', 'exact MT5 times replace the estimate');
+  assert.equal(t.commission, -3.5);
+  assert.equal(t.notes, 'from phone', 'notes kept');
+  assert.equal(t.planFollowed, true);
+  // Re-sync: already linked by ticket.
+  assert.equal((await ea(key, payload([pos(4242, { symbol: 'EURUSD.r' })], acct))).data.duplicates, 1);
+});

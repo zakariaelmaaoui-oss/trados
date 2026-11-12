@@ -14,6 +14,7 @@ import { getPrefs, SUPPORTED_CURRENCIES, sendTestNotification, prefImpacts, pref
 import { isValidSubscription } from './services/push.js';
 import { runScheduledJobs } from './scheduler.js';
 import { findToken, validatePayload, newSyncToken } from './services/mt5sync.js';
+import { normaliseSymbol } from '../client/src/profit.js';
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const bad = (msg) => new HttpError(400, msg);
@@ -164,12 +165,37 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
       ? (await db.all(`SELECT ticket FROM trades WHERE account_id=? AND ticket IN (${tickets.map(() => '?').join(',')})`, acc.id, ...tickets)).map((r) => r.ticket)
       : []);
     const fresh = v.valid.filter((p) => !existing.has(p.ticket)).sort((a, b) => a.open_time.localeCompare(b.open_time));
-    let imported = 0;
+    let imported = 0, matched = 0;
     const importedTickets = [];
+    // Trades typed in by hand on the phone (no ticket yet) are completed with the real MT5
+    // data instead of being duplicated. Match: same symbol, side and lots, times within 30 min.
+    const manual = fresh.length ? await db.all(`SELECT id, symbol, direction, volume, open_time, close_time FROM trades
+      WHERE account_id=? AND source='manual' AND ticket IS NULL AND close_time IS NOT NULL AND open_time BETWEEN ? AND ?`,
+    acc.id, new Date(Date.parse(fresh[0].open_time) - 86400e3).toISOString(), new Date(Date.parse(fresh[fresh.length - 1].open_time) + 86400e3).toISOString()) : [];
+    const used = new Set();
+    const WINDOW = 30 * 60e3;
+    const findManual = (x) => {
+      let best = null, bestDiff = Infinity;
+      for (const m of manual) {
+        if (used.has(m.id) || m.direction !== x.direction || Math.abs(m.volume - x.volume) > 1e-6 || normaliseSymbol(m.symbol) !== normaliseSymbol(x.symbol)) continue;
+        const d1 = Math.abs(Date.parse(m.open_time) - Date.parse(x.open_time)), d2 = Math.abs(Date.parse(m.close_time) - Date.parse(x.close_time));
+        if (d1 <= WINDOW && d2 <= WINDOW && d1 + d2 < bestDiff) { best = m; bestDiff = d1 + d2; }
+      }
+      if (best) used.add(best.id);
+      return best;
+    };
     if (fresh.length) {
       await db.tx(async (t) => {
         for (const x of fresh) {
           const risk = await riskAmountFor(t, acc, user.default_risk_pct, x.open_time);
+          const m = findManual(x);
+          if (m) {
+            await t.run(`UPDATE trades SET ticket=?, source='mt5_sync', symbol=?, volume=?, open_time=?, close_time=?, open_price=?, close_price=?,
+                         stop_loss=COALESCE(stop_loss, ?), take_profit=COALESCE(take_profit, ?), commission=?, swap=?, profit=?, risk_amount=COALESCE(?, risk_amount), corrected=0, updated_at=${NOW_ISO}
+                         WHERE id=?`, x.ticket, x.symbol, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, risk, m.id);
+            matched++;
+            continue;
+          }
           const r = await t.run(`INSERT INTO trades(user_id,account_id,ticket,source,symbol,direction,volume,open_time,close_time,open_price,close_price,stop_loss,take_profit,commission,swap,profit,risk_pct,risk_amount)
                                  VALUES(?,?,?,'mt5_sync',?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (account_id, ticket) DO NOTHING`,
           tok.user_id, acc.id, x.ticket, x.symbol, x.direction, x.volume, x.open_time, x.close_time, x.open_price, x.close_price, x.stop_loss, x.take_profit, x.commission, x.swap, x.profit, user.default_risk_pct, risk);
@@ -185,7 +211,7 @@ export function createApp(db, { publicDir, vapid, sender, fetchImpl, secureCooki
     await db.run('UPDATE accounts SET last_sync_at=? WHERE id=?', now().toISOString(), acc.id);
     await db.run('UPDATE sync_tokens SET last_used_at=?, last_received=?, last_imported=?, mt5_login=COALESCE(mt5_login, ?), mt5_server=COALESCE(?, mt5_server) WHERE id=?',
       now().toISOString(), req.body.positions.length, imported, tok.account_id ? v.login : null, tok.account_id ? v.server : null, tok.id);
-    res.json({ ok: true, account: acc.name, type: acc.type, received: req.body.positions.length, imported, duplicates: v.valid.length - fresh.length, invalid: v.invalid, importedTickets });
+    res.json({ ok: true, account: acc.name, type: acc.type, received: req.body.positions.length, imported, matched, duplicates: v.valid.length - fresh.length, invalid: v.invalid, importedTickets });
   }));
 
   app.use('/api', express.json({ limit: '200kb' }));

@@ -18,7 +18,7 @@ export default function Dashboard() {
   return (
     <>
       <PageHead title={`Hello, ${user.displayName}`} sub={`${fmtDay(data.today)} · ${data.timezone.replace('_', ' ')}`}>
-        <Link className="btn primary" to="/journal/new"><Icon.plus />New trade</Link>
+        <Link className="btn primary" to="/journal/quick"><Icon.plus />New trade</Link>
       </PageHead>
       <div className={`mode-banner ${data.mode}`} style={{ marginBottom: 16 }}>
         <Icon.shield width={16} />
@@ -35,7 +35,7 @@ export default function Dashboard() {
       <div className="grid g3" style={{ marginBottom: 16 }}>
         <Card className="span2 feature" title="Equity curve" icon={<Icon.trend />} sub={`Balance ${money(data.balance.current, ccy)} · started ${money(data.balance.starting, ccy)}`}>
           {hasTrades ? <EquityChart points={s.equity} currency={ccy} /> : (
-            <Empty icon={<Icon.trend />} action={<div className="row" style={{ justifyContent: 'center' }}><Link className="btn sm" to="/journal/new">Add a trade</Link><Link className="btn sm" to="/import">Import MT5 CSV</Link></div>}>
+            <Empty icon={<Icon.trend />} action={<div className="row" style={{ justifyContent: 'center' }}><Link className="btn sm" to="/journal/quick">Add a trade</Link><Link className="btn sm" to="/import">Import MT5 CSV</Link></div>}>
               No closed {data.mode} trades yet. Statistics appear once you record or import trades.
             </Empty>
           )}

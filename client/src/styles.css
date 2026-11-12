@@ -240,3 +240,16 @@ table.table { width: 100%; border-collapse: collapse; font-variant-numeric: tabu
   .shell { display: block; } .main { padding: 0; } body { background: #fff; }
   .card { box-shadow: none; break-inside: avoid; }
 }
+
+/* ---- quick trade (phone-first) ---- */
+.quick .field-label { font-size: 13px; font-weight: 560; color: var(--text-2); margin-bottom: 8px; }
+.seg.big { display: flex; width: 100%; }
+.seg.big button { flex: 1; padding: 12px 10px; font-size: 16px; }
+.seg.big button.on.buy { color: #fff; background: var(--pos); }
+.seg.big button.on.sell { color: #fff; background: var(--neg); }
+.chip.big { padding: 9px 14px; font-size: 14.5px; }
+.chip-input { width: 92px; height: 40px; border-radius: 99px; text-align: center; }
+.input.big { height: 50px; font-size: 18px; font-variant-numeric: tabular-nums; }
+.btn.big { height: 52px; font-size: 16px; width: 100%; border-radius: 16px; }
+.save-bar { position: sticky; bottom: 12px; z-index: 5; padding-top: 4px; }
+@media (max-width: 960px) { .save-bar { bottom: calc(80px + env(safe-area-inset-bottom)); } }
